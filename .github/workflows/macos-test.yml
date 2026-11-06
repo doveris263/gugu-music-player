@@ -1,0 +1,82 @@
+name: macOS 冒烟测试
+
+# 只验证「已发布的安装包能不能在真 Mac 上跑起来」。
+# runner 没有图形界面，所以不测 OBR 面板外观。
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            dir: darwin-arm64
+            label: Apple Silicon (arm64)
+          - os: macos-13
+            dir: darwin-x64
+            label: Intel (x86_64)
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: 下载已发布的安装包
+        run: |
+          curl -L --retry 3 -o app.zip \
+            "https://github.com/doveris263/gugu-music-player/releases/download/v1.0.3-macos/gugu-music-player-V1.0.3-macos.zip"
+          unzip -q app.zip -d app
+          ls app
+
+      - name: 补执行权限（模拟用户解压后）
+        run: |
+          chmod +x "app/runtime/${{ matrix.dir }}/node"
+          chmod +x "app/runtime/${{ matrix.dir }}/cloudflared"
+          chmod +x "app/启动.command" "app/卸载.command"
+          ls -l "app/runtime/${{ matrix.dir }}"
+
+      - name: 二进制能否执行
+        run: |
+          echo "--- arch ---"; uname -m
+          echo "--- node ---"; "app/runtime/${{ matrix.dir }}/node" --version
+          echo "--- cloudflared ---"; "app/runtime/${{ matrix.dir }}/cloudflared" --version
+
+      - name: 启动脚本语法
+        run: |
+          bash -n "app/启动.command" && echo "启动.command 语法 OK"
+          bash -n "app/卸载.command" && echo "卸载.command 语法 OK"
+
+      - name: 真正把服务跑起来
+        run: |
+          cd app
+          PORT=8899
+          "runtime/${{ matrix.dir }}/node" scripts/setup.mjs --port $PORT --no-tunnel > server.out 2>&1 &
+          NODE_PID=$!
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -fsS "http://localhost:$PORT/api/health" > health.json 2>/dev/null; then
+              echo "connected at ${i}s"; break
+            fi
+          done
+          echo "--- health ---"; cat health.json || echo "(no response)"
+          echo "--- server output ---"; cat server.out
+          kill $NODE_PID 2>/dev/null || true
+          sleep 1
+          grep -q '"ok":true' health.json || (echo "health not ok"; exit 1)
+          grep -q '"version":"1.0.3"' health.json || (echo "wrong version"; exit 1)
+          echo "PASS: server started and reports 1.0.3"
+
+      - name: 扩展清单可访问
+        run: |
+          cd app
+          PORT=8899
+          "runtime/${{ matrix.dir }}/node" scripts/setup.mjs --port $PORT --no-tunnel > server2.out 2>&1 &
+          NODE_PID=$!
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -fsS "http://localhost:$PORT/manifest.json" > manifest.json 2>/dev/null; then break; fi
+          done
+          echo "--- manifest ---"; cat manifest.json || echo "(unavailable)"
+          kill $NODE_PID 2>/dev/null || true
+          grep -q '"name"' manifest.json || (echo "manifest invalid"; exit 1)
+          echo "PASS: manifest served"
