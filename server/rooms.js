@@ -307,11 +307,23 @@ export class Store {
         bump();
         return { ok: true };
       }
-      case "track.update":
+      case "track.update": {
+        // 只收标题和歌手；名字必须非空，超长按界面显示宽度截断
+        const patch = {};
+        if (cmd.patch?.title !== undefined) {
+          const title = String(cmd.patch.title).replace(/\s+/g, " ").trim().slice(0, 40);
+          if (!title) return { ok: false, error: "曲名不能为空" };
+          patch.title = title;
+        }
+        if (cmd.patch?.artist !== undefined) {
+          patch.artist = String(cmd.patch.artist).replace(/\s+/g, " ").trim().slice(0, 24);
+        }
+        if (!Object.keys(patch).length) return { ok: true };
         freeze();
-        if (!this.updateTrack(roomId, String(cmd.trackId), cmd.patch || {})) return { ok: false, error: "曲目不存在" };
+        if (!this.updateTrack(roomId, String(cmd.trackId), patch)) return { ok: false, error: "曲目不存在" };
         bump();
         return { ok: true };
+      }
       case "folder": {
         const name = cleanFolder(cmd.name);
         const op = String(cmd.op || "create");

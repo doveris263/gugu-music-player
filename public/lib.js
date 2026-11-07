@@ -90,33 +90,106 @@ export async function apiPost(path, body, token) {
   );
 }
 
-/** 上传音频（XHR 才有上传进度）。 */
+/** 上传音频：切成 4MB 的片子传，断一片只重传一片，别整首从头再来。 */
+const UPLOAD_CHUNK = 4 * 1024 * 1024;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function uploadId() {
+  const a = new Uint8Array(8);
+  crypto.getRandomValues(a);
+  return [...a].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export function uploadTrack({ roomId, token, file, duration, folder, onProgress }) {
-  return new Promise((resolve, reject) => {
-    const qs = new URLSearchParams({
-      name: file.name || "音频",
-      duration: String(Math.round(Number(duration) || 0)),
-      folder: folder || "",
-    });
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", `${apiBase()}/api/rooms/${encodeURIComponent(roomId)}/tracks?${qs}`);
-    xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
-    };
-    xhr.onload = () => {
-      let body = null;
-      try {
-        body = JSON.parse(xhr.responseText);
-      } catch {
-        return reject(new Error("服务器返回异常"));
-      }
-      if (xhr.status >= 200 && xhr.status < 300) resolve(body);
-      else reject(new Error(body?.error || `上传失败 (${xhr.status})`));
-    };
-    xhr.onerror = () => reject(new Error("网络错误"));
-    xhr.send(file);
+  const base = `${apiBase()}/api/rooms/${encodeURIComponent(roomId)}`;
+  const qs = new URLSearchParams({
+    id: uploadId(),
+    name: file.name || "音频",
+    duration: String(Math.round(Number(duration) || 0)),
+    folder: folder || "",
   });
+  const total = file.size || 0;
+  const report = (v) => {
+    try {
+      onProgress?.(Math.max(0, Math.min(1, v)));
+    } catch {}
+  };
+
+  // 发一片；网络错误标记 net，服务端 4xx 带 status，交由外层决定重试还是放弃
+  const post = (url, body) =>
+    new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", url);
+      xhr.timeout = 240000;
+      xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+      if (body) {
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) report((body.offset + e.loaded) / (total || 1));
+        };
+      }
+      xhr.onload = () => {
+        let data = null;
+        try {
+          data = JSON.parse(xhr.responseText);
+        } catch {}
+        if (xhr.status >= 200 && xhr.status < 300) return resolve(data || {});
+        reject(Object.assign(new Error(data?.error || `上传失败 (${xhr.status})`), { status: xhr.status, body: data }));
+      };
+      xhr.onerror = () => reject(Object.assign(new Error("网络错误"), { net: true }));
+      xhr.ontimeout = () => reject(Object.assign(new Error("网络超时"), { net: true }));
+      xhr.send(body ? body.blob : undefined);
+    });
+
+  return (async () => {
+    let offset = 0;
+    let tries = 0;
+    let restarts = 0;
+
+    while (offset < total) {
+      const end = Math.min(offset + UPLOAD_CHUNK, total);
+      const blob = file.slice(offset, end);
+      try {
+        const r = await post(`${base}/tracks/chunk?${qs}&offset=${offset}`, { blob, offset });
+        const got = Number(r.received);
+        offset = Number.isFinite(got) ? Math.min(got, total) : end;
+        tries = 0;
+        report(offset / (total || 1));
+      } catch (err) {
+        // 服务端说「你已经传到这里了」：接着传
+        if (err.status === 409 && Number.isFinite(err.body?.received)) {
+          offset = Math.min(err.body.received, total);
+          tries = 0;
+          continue;
+        }
+        // 服务端重启过，半截文件没了：从头再来一次
+        if (err.status === 410 && restarts++ < 1) {
+          offset = 0;
+          tries = 0;
+          continue;
+        }
+        if (!err.net && !(err.status >= 500)) throw err;
+        if (++tries > 4) {
+          const pct = total ? Math.round((offset / total) * 100) : 0;
+          throw new Error(`网络不稳定，重试多次仍未成功（已传 ${pct}%）`);
+        }
+        await sleep(600 * tries);
+      }
+    }
+
+    // 收尾：整首都传完了，这一步更不能因为一次抖动就前功尽弃
+    let res = null;
+    for (let i = 0; ; i++) {
+      try {
+        res = await post(`${base}/tracks/commit?${qs}`, null);
+        break;
+      } catch (err) {
+        if (i >= 3 || (!err.net && !(err.status >= 500))) throw err;
+        await sleep(700 * (i + 1));
+      }
+    }
+    report(1);
+    return res;
+  })();
 }
 
 /** 上传前读时长：进度条和自动切歌都靠它。 */

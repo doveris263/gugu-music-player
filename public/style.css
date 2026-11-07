@@ -244,6 +244,24 @@ input[type="range"]::-webkit-slider-thumb { appearance: none; width: 13px; heigh
 }
 .folder-input:focus { outline: none; border-color: rgba(232, 195, 122, 0.9); }
 
+/* 曲目改名：整行换成输入框，保存后走 track.update */
+.row.editing { background: rgba(232, 195, 122, 0.07); border-color: rgba(232, 195, 122, 0.3); }
+.rename-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 9px;
+  border-radius: 6px;
+  border: 1px solid rgba(232, 195, 122, 0.5);
+  background: rgba(255, 255, 255, 0.06);
+  color: #f2e8d2;
+  font-size: 12px;
+  font-family: inherit;
+}
+.rename-input.sub { margin-top: 4px; font-size: 11px; color: #cfc6b4; }
+.rename-input::placeholder { color: rgba(242, 232, 210, 0.38); }
+.rename-input:focus { outline: none; border-color: rgba(232, 195, 122, 0.9); background: rgba(255, 255, 255, 0.1); }
+.rename-btns { display: flex; gap: 6px; margin-top: 6px; }
+
 /* 页头使用真实图标（不再是单色 SVG） */
 .mark { overflow: hidden; padding: 0; }
 .mark img { width: 100%; height: 100%; object-fit: cover; display: block; }

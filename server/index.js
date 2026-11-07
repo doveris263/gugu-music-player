@@ -396,7 +396,13 @@ const route = (method, pattern, handler) => {
 };
 
 route("GET", "/api/health", (req, res) =>
-  json(req, res, 200, { ok: true, version: currentVersion(), time: Date.now(), needsKey: Boolean(ADMIN_KEY) })
+  json(req, res, 200, {
+    ok: true,
+    version: currentVersion(),
+    time: Date.now(),
+    needsKey: Boolean(ADMIN_KEY),
+    maxUpload: MAX_UPLOAD,
+  })
 );
 
 route("POST", "/api/report", async (req, res) => {
@@ -531,6 +537,145 @@ route("POST", "/api/rooms/:room/command", async (req, res, p, search) => {
   json(req, res, 200, { ok: true, state: buildState(store.get(p.room)), now: buildNow(store.get(p.room)) });
 });
 
+// ---------- 分片上传 ----------
+// 一次性 POST 整个文件，在隧道链路上断一次就得从头再来（玩家反馈的「偶尔网络错误」）。
+// 切成 4~8MB 的片子独立重试，抖动只影响一片；服务端按偏移追加，偏移对不上就让客户端续传。
+const CHUNK_MAX = 8 * 1024 * 1024;
+const UPLOAD_TMP = path.join(DATA_DIR, "tmp");
+fs.mkdirSync(UPLOAD_TMP, { recursive: true });
+const uploads = new Map(); // uploadId -> { room, file, size, name, at }
+
+function dropUpload(uploadId) {
+  const st = uploads.get(uploadId);
+  if (!st) return;
+  uploads.delete(uploadId);
+  fs.unlink(st.file, () => {});
+}
+
+// 半截上传最长留 2 小时，之后连文件一起清掉
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, st] of uploads) if (now - st.at > 2 * 3600e3) dropUpload(id);
+}, 10 * 60e3).unref?.();
+
+function readBuffer(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let done = false;
+    const fail = (err) => {
+      if (done) return;
+      done = true;
+      reject(err);
+    };
+    req.on("data", (c) => {
+      if (done) return;
+      size += c.length;
+      if (size > limit) {
+        fail(Object.assign(new Error("分片过大"), { statusCode: 413 }));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (done) return;
+      done = true;
+      resolve(Buffer.concat(chunks));
+    });
+    req.on("error", fail);
+    req.on("aborted", () => fail(Object.assign(new Error("连接中断"), { statusCode: 400 })));
+  });
+}
+
+// 追加一个分片；offset 必须是服务端已有的字节数，否则返回 409 + received 让客户端续上
+route("POST", "/api/rooms/:room/tracks/chunk", async (req, res, p, search) => {
+  if (!guard(req, res, p.room, bearer(req, search))) return;
+
+  const uploadId = String(search.get("id") || "");
+  if (!/^[A-Za-z0-9]{8,40}$/.test(uploadId)) return json(req, res, 400, { error: "上传标识无效" });
+  const name = String(search.get("name") || "音频").slice(0, 160);
+  if (!isAudio(name)) return json(req, res, 415, { error: "不支持的格式，请上传 mp3 / m4a / ogg / wav / flac" });
+  const offset = Number(search.get("offset") || 0);
+
+  let buf;
+  try {
+    buf = await readBuffer(req, CHUNK_MAX);
+  } catch (err) {
+    return json(req, res, err.statusCode || 400, { error: err.message });
+  }
+  if (!buf.length) return json(req, res, 400, { error: "空分片" });
+
+  let st = uploads.get(uploadId);
+  if (!st) {
+    if (offset !== 0) return json(req, res, 410, { error: "上传已过期，请重新上传", expired: true });
+    st = { room: p.room, file: path.join(UPLOAD_TMP, `${uploadId}.part`), size: 0, name, at: Date.now() };
+    uploads.set(uploadId, st);
+  }
+  if (st.room !== p.room) return json(req, res, 403, { error: "上传标识不属于这个房间" });
+  if (offset !== st.size) return json(req, res, 409, { error: "位置不匹配", received: st.size });
+  if (st.size + buf.length > MAX_UPLOAD) {
+    dropUpload(uploadId);
+    return json(req, res, 413, { error: `文件超过 ${Math.round(MAX_UPLOAD / 1024 / 1024)}MB` });
+  }
+
+  try {
+    await fs.promises.appendFile(st.file, buf);
+  } catch (err) {
+    dropUpload(uploadId);
+    logError("[upload]", err);
+    return json(req, res, 500, { error: "写入磁盘失败" });
+  }
+  st.size += buf.length;
+  st.at = Date.now();
+  json(req, res, 200, { ok: true, received: st.size });
+});
+
+// 收尾：把 .part 落到曲目目录并建条目
+route("POST", "/api/rooms/:room/tracks/commit", async (req, res, p, search) => {
+  if (!guard(req, res, p.room, bearer(req, search))) return;
+
+  const uploadId = String(search.get("id") || "");
+  const st = uploads.get(uploadId);
+  if (!st || st.room !== p.room) return json(req, res, 410, { error: "上传已过期，请重新上传", expired: true });
+
+  const rawName = String(search.get("name") || st.name || "音频").slice(0, 160);
+  if (!isAudio(rawName)) {
+    dropUpload(uploadId);
+    return json(req, res, 415, { error: "不支持的格式，请上传 mp3 / m4a / ogg / wav / flac" });
+  }
+  if (!st.size) {
+    dropUpload(uploadId);
+    return json(req, res, 400, { error: "空文件" });
+  }
+
+  const id = uid(6);
+  const ext = path.extname(rawName).toLowerCase();
+  const dest = path.join(store.tracksDir(p.room), `${id}${ext}`);
+  try {
+    await fs.promises.rename(st.file, dest);
+  } catch (err) {
+    logError("[upload]", err);
+    dropUpload(uploadId);
+    return json(req, res, 500, { error: "写入磁盘失败" });
+  }
+  uploads.delete(uploadId);
+
+  const track = store.addTrack(p.room, {
+    id,
+    kind: "upload",
+    title: rawName.replace(/\.[^.]+$/, "").slice(0, 120),
+    artist: "本地文件",
+    fileName: `${id}${ext}`,
+    mime: sniffAudio(dest) || audioMimeFor(rawName),
+    size: st.size,
+    duration: Number(search.get("duration")) || 0,
+    folder: cleanFolder(search.get("folder") || ""),
+  });
+  log(`  [上传] ${rawName} ${(st.size / 1024 / 1024).toFixed(1)}MB`);
+  publish(p.room);
+  json(req, res, 200, { ok: true, track });
+});
+
 // 上传本地音乐（原始字节流，避免 multipart）
 route("POST", "/api/rooms/:room/tracks", (req, res, p, search) => {
   if (!guard(req, res, p.room, bearer(req, search))) return;
@@ -546,6 +691,15 @@ route("POST", "/api/rooms/:room/tracks", (req, res, p, search) => {
 
   let size = 0;
   let failed = false;
+  const started = Date.now();
+  // 断开时记一笔：玩家反馈「偶尔网络错误」，服务端得有痕迹才知道断在哪个环节
+  req.on("aborted", () => {
+    if (failed) return;
+    log(
+      `  [上传中断] ${rawName} 已收 ${(size / 1024 / 1024).toFixed(1)}MB，` +
+        `用时 ${((Date.now() - started) / 1000).toFixed(0)}s`
+    );
+  });
   const fail = (code, msg) => {
     if (failed) return;
     failed = true;
@@ -723,6 +877,10 @@ const server = http.createServer(async (req, res) => {
     json(req, res, err.statusCode || 500, { error: err.message || "服务器错误" });
   }
 });
+
+// 慢链路上传一个大文件可能要几分钟，Node 18+ 默认 requestTimeout=300s 会在中途把连接掐掉
+server.requestTimeout = 0;
+server.headersTimeout = 60000;
 
 /**
  * 启动时的恢复工作：

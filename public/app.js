@@ -13,6 +13,7 @@ const ICON = {
   loop1: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.60 12.00A7.4 7.4 0 0 1 18.06 7.76"/><path d="M19.27 9.48L16.55 8.82L19.58 6.69Z" fill="currentColor" stroke="none"/><path d="M19.40 12.00A7.4 7.4 0 0 1 5.94 16.24"/><path d="M4.73 14.52L7.45 15.18L4.42 17.31Z" fill="currentColor" stroke="none"/><text x="12" y="14.9" text-anchor="middle" font-size="8.6" font-weight="700" fill="currentColor" stroke="none">1</text></svg>',
   music: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V6.2c0-.5.3-.9.8-1L18 3.3c.7-.2 1.4.3 1.4 1v1.2c0 .5-.3.9-.8 1L11.5 8v10.2"/><circle cx="6.9" cy="18" r="2.6"/><circle cx="16.4" cy="18" r="2.6"/></svg>',
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.1c.5 0 1 .2 1.4.6L11.5 7h7A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z"/></svg>',
+  edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4.2l9.6-9.6a2.1 2.1 0 0 0 0-3l-1.2-1.2a2.1 2.1 0 0 0-3 0L4 15.8z"/><path d="M13.4 6.9l3.7 3.7"/></svg>',
   trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6.5 7l.9 12a2 2 0 0 0 2 1.9h5.2a2 2 0 0 0 2-1.9L17.5 7"/><path d="M9.5 7V5a2 2 0 0 1 2-2h1a2 2 0 0 1 2 2v2"/></svg>',
   upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4.5"/><path d="M7.5 9 12 4.5 16.5 9"/><path d="M4 16.5v2A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5v-2"/></svg>',
   volume: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5.5 6.8 9H3.5v6h3.3l4.2 3.5z"/><path d="M15.5 8.7a4.7 4.7 0 0 1 0 6.6"/><path d="M18.2 6a8.4 8.4 0 0 1 0 12"/></svg>',
@@ -49,6 +50,7 @@ const S = {
   openFolderFor: null,
   ask: null, // 自定义确认框 {text, cmd, action}
   creatingFolder: false,
+  renaming: null, // 正在改名的曲目 { id, title, artist }
   sliderActive: false,
   sliderTimer: null,
 };
@@ -64,6 +66,8 @@ function render(force) {
   // 正在拖滑块时绝不重建 DOM：否则 <input> 会被销毁替换，浏览器直接丢掉拖拽，
   // 表现就是"拖不动/一跳一跳"。松手后由 markSlider 的定时器统一补一次渲染。
   if (S.sliderActive) return;
+  // 改名输入框同理：广播把列表整个重建会丢焦点和已输入的字，等保存/取消再重绘
+  if (S.renaming && !force) return;
   if (queued && !force) return;
   queued = true;
   requestAnimationFrame(() => {
@@ -261,6 +265,23 @@ function listView(list) {
             .join("")}<button class="chip chip-add" data-act="folder-new">＋</button></div>`
         : "";
 
+      // 改名中：把这一行换成两个输入框，保存后写回 track.update
+      if (S.renaming && S.renaming.id === t.id) {
+        return `<div class="row editing ${on ? "playing" : ""}">
+      <span class="idx">${on ? "▶" : i + 1}</span>
+      <div class="row-main">
+        <input class="rename-input" data-rename="title" maxlength="40" placeholder="曲名"
+          value="${esc(S.renaming.title || "")}" />
+        <input class="rename-input sub" data-rename="artist" maxlength="24" placeholder="歌手（可留空）"
+          value="${esc(S.renaming.artist || "")}" />
+        <div class="rename-btns">
+          <button class="chip active" data-act="rename-ok" data-id="${esc(t.id)}">保存</button>
+          <button class="chip" data-act="rename-cancel">取消</button>
+        </div>
+      </div>
+    </div>`;
+      }
+
       return `<div class="row ${on ? "playing" : ""}">
       <span class="idx">${on ? "▶" : i + 1}</span>
       <div class="row-main" data-act="pick" data-id="${esc(t.id)}">
@@ -270,6 +291,7 @@ function listView(list) {
             t.folder ? `<span class="tag folder-tag">${esc(t.folder)}</span>` : ""
           }${t.duration > 0 ? `<span>${fmt(t.duration)}</span>` : ""}</div>
       </div>
+      <button class="icon-btn rename-btn" data-act="rename" data-id="${esc(t.id)}" title="重命名">${icon("edit")}</button>
       <button class="icon-btn folder-btn ${open ? "active" : ""}" data-act="row-folder" data-id="${esc(t.id)}" title="移到分类">${icon(
         "folder"
       )}</button>
@@ -551,7 +573,14 @@ async function doUpload(files) {
       });
       done++;
     } catch (err) {
-      toast(`${file.name}：${err.message}`, "err");
+      // 失败上报到服务端日志：下次再出现「偶尔失败」时，GM 的日志里能查到是哪一步
+      report("upload-fail", {
+        name: file.name,
+        size: file.size,
+        pct: Math.round((S.uploading?.pct || 0) * 100),
+        msg: String(err?.message || err),
+      });
+      toast(`${file.name}：${err.message}${err?.net ? "，重试一次通常就好" : ""}`, "err");
     }
   }
   S.uploading = { name: "", pct: 1, done };
@@ -620,6 +649,38 @@ document.addEventListener("click", (ev) => {
     render(true);
     return;
 
+  } else if (act === "rename") {
+    const t = (S.state?.playlist || []).find((x) => x.id === id);
+    if (!t) return;
+    S.renaming = { id, title: t.title || "", artist: t.artist || "" };
+    S.openFolderFor = null;
+    render(true);
+    setTimeout(() => {
+      const el = document.querySelector('.rename-input[data-rename="title"]');
+      el?.focus();
+      el?.select();
+    }, 60);
+    return;
+  } else if (act === "rename-ok") {
+    // 先取值再重绘（重绘会换掉输入框元素）
+    const titleEl = document.querySelector('.rename-input[data-rename="title"]');
+    const artistEl = document.querySelector('.rename-input[data-rename="artist"]');
+    const title = (titleEl?.value ?? "").trim().replace(/\s+/g, " ").slice(0, 40);
+    const artist = (artistEl?.value ?? "").trim().replace(/\s+/g, " ").slice(0, 24);
+    const targetId = S.renaming?.id || id;
+    if (!title) {
+      toast("曲名不能为空", "err");
+      return;
+    }
+    S.renaming = null;
+    render(true);
+    command({ type: "track.update", trackId: targetId, patch: { title, artist } });
+    return;
+  } else if (act === "rename-cancel") {
+    S.renaming = null;
+    render(true);
+    return;
+
   } else if (act === "folder-tab") {
     S.folderTab = el.dataset.folder ?? "__all";
     render(true);
@@ -635,6 +696,25 @@ document.addEventListener("click", (ev) => {
     return;
   }
   render(true);
+});
+
+// 改名输入框：边打字边同步进 S.renaming，中途万一重绘也不会把字吞掉
+document.addEventListener("input", (ev) => {
+  const el = ev.target?.closest?.(".rename-input");
+  if (!el || !S.renaming) return;
+  if (el.dataset.rename === "title") S.renaming.title = el.value;
+  else S.renaming.artist = el.value;
+});
+document.addEventListener("keydown", (ev) => {
+  if (!S.renaming) return;
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    document.querySelector('[data-act="rename-ok"]')?.click();
+  } else if (ev.key === "Escape") {
+    ev.preventDefault();
+    S.renaming = null;
+    render(true);
+  }
 });
 
 // 全房间音量：拖动时会连续触发 input，节流成每 200ms 最多发一次，

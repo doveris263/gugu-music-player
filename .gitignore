@@ -39,3 +39,4 @@ pv.html
 tools/_*.mjs
 tools/_*.py
 .update/
+.data-*/
