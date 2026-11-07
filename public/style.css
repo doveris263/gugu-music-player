@@ -261,6 +261,8 @@ input[type="range"]::-webkit-slider-thumb { appearance: none; width: 13px; heigh
 .rename-input::placeholder { color: rgba(242, 232, 210, 0.38); }
 .rename-input:focus { outline: none; border-color: rgba(232, 195, 122, 0.9); background: rgba(255, 255, 255, 0.1); }
 .rename-btns { display: flex; gap: 6px; margin-top: 6px; }
+.rename-btn { color: var(--dim); }
+.rename-btn:hover { color: var(--gold); background: rgba(214,180,110,0.14); }
 
 /* 页头使用真实图标（不再是单色 SVG） */
 .mark { overflow: hidden; padding: 0; }
