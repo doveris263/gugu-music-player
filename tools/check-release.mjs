@@ -12,6 +12,14 @@ const SELF_PATH = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(process.argv[2] || path.join(path.dirname(SELF_PATH), ".."));
 
 const SKIP_DIRS = new Set(["node_modules", ".git", ".bin", "data", "vendor", "shots"]);
+// 本机数据目录：.thincoder 会话缓存 / .edge-demo 演示数据 / .eac-music 素材 / .data-* 的 demo
+// 与 repro 存档。它们已被 .gitignore 排除，内容不随仓库发布，所以不做内容扫描——否则会把
+// 本机调试数据里的令牌报成致命项，发布门在这台机器上永远绿不了。它们仍可能被网页拖拽上传
+// 带走，所以第 1 节照旧逐个告警。
+const LOCAL_ONLY_DIRS = [".thincoder", ".edge-demo", ".eac-music"];
+const LOCAL_ONLY_PREFIXES = [".data-"];
+const isLocalOnly = (name) => LOCAL_ONLY_DIRS.includes(name) || LOCAL_ONLY_PREFIXES.some((p) => name.startsWith(p));
+const skipDir = (name) => SKIP_DIRS.has(name) || isLocalOnly(name);
 const SELF = path.basename(SELF_PATH);
 const TEXT_EXT = new Set([".js", ".mjs", ".json", ".html", ".css", ".md", ".yml", ".yaml", ".bat", ".sh", ".txt", ""]);
 
@@ -25,6 +33,13 @@ for (const [dir, why] of [
 ]) {
   if (fs.existsSync(path.join(ROOT, dir))) {
     warn.push(`目录 ${dir}/ 存在 —— ${why}。.gitignore 会排除它，但 GitHub 网页拖拽上传不会！`);
+  }
+}
+
+// 本机数据目录同理：内容不扫（见 isLocalOnly），但存在要说一声。
+for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
+  if (entry.isDirectory() && isLocalOnly(entry.name)) {
+    warn.push(`目录 ${entry.name}/ 存在 —— 本机调试数据。.gitignore 会排除它，但 GitHub 网页拖拽上传不会！`);
   }
 }
 
@@ -42,7 +57,7 @@ function walk(dir, out = []) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const abs = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      if (SKIP_DIRS.has(entry.name)) continue;
+      if (skipDir(entry.name)) continue;
       walk(abs, out);
     } else if (entry.isFile()) {
       out.push(abs);
