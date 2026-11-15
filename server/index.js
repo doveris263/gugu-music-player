@@ -68,6 +68,8 @@ const AUDIO = {
 const mimeFor = (p) => MIME[path.extname(p).toLowerCase()] || "application/octet-stream";
 const audioMimeFor = (p) => AUDIO[path.extname(p).toLowerCase()] || "";
 const isAudio = (p) => Boolean(audioMimeFor(p));
+/** 拒收文案也只从这份清单派生，不另写一份格式名字。 */
+const AUDIO_LIST = Object.keys(AUDIO).map((f) => f.slice(1)).join(" / ");
 
 /** 按文件头判断真实类型（很多人把 mp4 改名成 .aac）。 */
 function sniffAudio(file) {
@@ -402,6 +404,8 @@ route("GET", "/api/health", (req, res) =>
     time: Date.now(),
     needsKey: Boolean(ADMIN_KEY),
     maxUpload: MAX_UPLOAD,
+    // 支持格式的唯一来源：选择器的 accept、界面文案、服务端白名单都出自它
+    formats: Object.keys(AUDIO),
   })
 );
 
@@ -558,6 +562,20 @@ setInterval(() => {
   for (const [id, st] of uploads) if (now - st.at > 2 * 3600e3) dropUpload(id);
 }, 10 * 60e3).unref?.();
 
+/**
+ * 上传事件的留痕行（F6）：一条事件一行，四字段固定齐全 —— 房间、文件名、已收字节、耗时。
+ * 已收字节写成「已收/总」；总字节未知时写 ?，不编数字。文件名里的换行抹平，守住一条一行。
+ */
+function logUpload(event, { room = "", name = "", received = 0, total = null, cost = null, detail = "" } = {}) {
+  const recv = Number(received) || 0;
+  const tot = Number.isFinite(total) ? String(total) : "?";
+  const ms = Number.isFinite(cost) ? String(cost) : "?";
+  const file = String(name || "-")
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, 160);
+  log(`[upload] ${event} room=${room || "-"} file=${file} received=${recv}/${tot} cost=${ms}ms` + (detail ? ` detail=${detail}` : ""));
+}
+
 function readBuffer(req, limit) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -566,7 +584,8 @@ function readBuffer(req, limit) {
     const fail = (err) => {
       if (done) return;
       done = true;
-      reject(err);
+      // 带上已经收到的字节数：中断与超限的留痕要写「已收多少」，不然那行日志只能写个 0
+      reject(Object.assign(err, { received: size }));
     };
     req.on("data", (c) => {
       if (done) return;
@@ -590,30 +609,47 @@ function readBuffer(req, limit) {
 // 追加一个分片；offset 必须是服务端已有的字节数，否则返回 409 + received 让客户端续上
 route("POST", "/api/rooms/:room/tracks/chunk", async (req, res, p, search) => {
   if (!guard(req, res, p.room, bearer(req, search))) return;
+  const t0 = Date.now();
 
   const uploadId = String(search.get("id") || "");
   if (!/^[A-Za-z0-9]{8,40}$/.test(uploadId)) return json(req, res, 400, { error: "上传标识无效" });
   const name = String(search.get("name") || "音频").slice(0, 160);
-  if (!isAudio(name)) return json(req, res, 415, { error: "不支持的格式，请上传 mp3 / m4a / ogg / wav / flac" });
   const offset = Number(search.get("offset") || 0);
+  const prev = uploads.get(uploadId);
+  // 这一片本来应该传到的位置：已收字节 + 本片的 Content-Length（分块传输没这个头时就只能算作已收字节），
+  // 拿它当留痕里的「总共」
+  const total = offset + Math.max(0, Number(req.headers["content-length"]) || 0);
+  const note = (event, received, detail) =>
+    logUpload(event, { room: p.room, name, received, total, cost: Date.now() - t0, detail });
+
+  if (!isAudio(name)) {
+    note("reject-format", prev?.size || 0, "格式不支持");
+    return json(req, res, 415, { error: `不支持的格式，请上传 ${AUDIO_LIST}` });
+  }
 
   let buf;
   try {
     buf = await readBuffer(req, CHUNK_MAX);
   } catch (err) {
+    // 分片读到半路断开：以前这里什么都不记，别人的机器上传失败时无从查起
+    if (err.statusCode === 400) note("chunk-abort", (prev?.size || 0) + (err.received || 0), "连接中断");
     return json(req, res, err.statusCode || 400, { error: err.message });
   }
   if (!buf.length) return json(req, res, 400, { error: "空分片" });
 
-  let st = uploads.get(uploadId);
+  let st = prev;
   if (!st) {
-    if (offset !== 0) return json(req, res, 410, { error: "上传已过期，请重新上传", expired: true });
+    if (offset !== 0) {
+      note("reject-expired", 0, "没有这个上传记录");
+      return json(req, res, 410, { error: "上传已过期，请重新上传", expired: true });
+    }
     st = { room: p.room, file: path.join(UPLOAD_TMP, `${uploadId}.part`), size: 0, name, at: Date.now() };
     uploads.set(uploadId, st);
   }
   if (st.room !== p.room) return json(req, res, 403, { error: "上传标识不属于这个房间" });
   if (offset !== st.size) return json(req, res, 409, { error: "位置不匹配", received: st.size });
   if (st.size + buf.length > MAX_UPLOAD) {
+    note("reject-size", st.size, `超过 ${Math.round(MAX_UPLOAD / 1024 / 1024)}MB 上限`);
     dropUpload(uploadId);
     return json(req, res, 413, { error: `文件超过 ${Math.round(MAX_UPLOAD / 1024 / 1024)}MB` });
   }
@@ -621,6 +657,7 @@ route("POST", "/api/rooms/:room/tracks/chunk", async (req, res, p, search) => {
   try {
     await fs.promises.appendFile(st.file, buf);
   } catch (err) {
+    note("chunk-fail", st.size, err.message || "写入磁盘失败");
     dropUpload(uploadId);
     logError("[upload]", err);
     return json(req, res, 500, { error: "写入磁盘失败" });
@@ -633,15 +670,28 @@ route("POST", "/api/rooms/:room/tracks/chunk", async (req, res, p, search) => {
 // 收尾：把 .part 落到曲目目录并建条目
 route("POST", "/api/rooms/:room/tracks/commit", async (req, res, p, search) => {
   if (!guard(req, res, p.room, bearer(req, search))) return;
+  const t0 = Date.now();
 
   const uploadId = String(search.get("id") || "");
   const st = uploads.get(uploadId);
-  if (!st || st.room !== p.room) return json(req, res, 410, { error: "上传已过期，请重新上传", expired: true });
+  if (!st || st.room !== p.room) {
+    logUpload("reject-expired", {
+      room: p.room,
+      name: String(search.get("name") || "-"),
+      received: 0,
+      cost: Date.now() - t0,
+      detail: "没有这个上传记录",
+    });
+    return json(req, res, 410, { error: "上传已过期，请重新上传", expired: true });
+  }
 
   const rawName = String(search.get("name") || st.name || "音频").slice(0, 160);
+  const note = (event, detail) =>
+    logUpload(event, { room: p.room, name: rawName, received: st.size, total: st.size, cost: Date.now() - t0, detail });
   if (!isAudio(rawName)) {
+    note("reject-format", "格式不支持");
     dropUpload(uploadId);
-    return json(req, res, 415, { error: "不支持的格式，请上传 mp3 / m4a / ogg / wav / flac" });
+    return json(req, res, 415, { error: `不支持的格式，请上传 ${AUDIO_LIST}` });
   }
   if (!st.size) {
     dropUpload(uploadId);
@@ -654,6 +704,7 @@ route("POST", "/api/rooms/:room/tracks/commit", async (req, res, p, search) => {
   try {
     await fs.promises.rename(st.file, dest);
   } catch (err) {
+    note("commit-fail", err.message || "写入磁盘失败");
     logError("[upload]", err);
     dropUpload(uploadId);
     return json(req, res, 500, { error: "写入磁盘失败" });
@@ -679,9 +730,13 @@ route("POST", "/api/rooms/:room/tracks/commit", async (req, res, p, search) => {
 // 上传本地音乐（原始字节流，避免 multipart）
 route("POST", "/api/rooms/:room/tracks", (req, res, p, search) => {
   if (!guard(req, res, p.room, bearer(req, search))) return;
+  const t0 = Date.now();
 
   const rawName = String(search.get("name") || "音频").slice(0, 160);
-  if (!isAudio(rawName)) return json(req, res, 415, { error: "不支持的格式，请上传 mp3 / m4a / ogg / wav / flac" });
+  if (!isAudio(rawName)) {
+    logUpload("reject-format", { room: p.room, name: rawName, received: 0, cost: Date.now() - t0, detail: "格式不支持" });
+    return json(req, res, 415, { error: `不支持的格式，请上传 ${AUDIO_LIST}` });
+  }
   const duration = Number(search.get("duration")) || 0;
   const ext = path.extname(rawName).toLowerCase();
   const id = uid(6);

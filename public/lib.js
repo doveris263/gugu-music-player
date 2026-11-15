@@ -92,7 +92,18 @@ export async function apiPost(path, body, token) {
 
 /** 上传音频：切成 4MB 的片子传，断一片只重传一片，别整首从头再来。 */
 const UPLOAD_CHUNK = 4 * 1024 * 1024;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** 单个请求的超时上限（规格 F2：30 秒）。 */
+const REQ_TIMEOUT = 30000;
+/** 连续这么久没有字节推进就判「连接停滞」，中止当前请求交给重试（规格 F2）。 */
+const STALL_MS = 30000;
+/** 每个步骤最多重试 4 次，含首次共 5 次尝试，分片与收尾同一口径（规格 F3）。 */
+const RETRY_MAX = 4;
+/** 进度上限：收尾请求返回之前不出现 100%（规格 F1）。 */
+const PCT_CAP = 0.99;
+/** 失败原因要写清卡在哪个阶段，所以每个阶段有个中文名。 */
+const PHASE_TEXT = { prepare: "准备中", sending: "传输中", committing: "收尾中" };
+
+const sizeMB = (n) => String(Math.round(((Number(n) || 0) / 1024 / 1024) * 10) / 10);
 
 function uploadId() {
   const a = new Uint8Array(8);
@@ -100,7 +111,30 @@ function uploadId() {
   return [...a].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-export function uploadTrack({ roomId, token, file, duration, folder, onProgress }) {
+/**
+ * 上传一首音频：发送前校验 → 分片 → 收尾，每一步都通过 onState 报给界面。
+ *
+ * 用一台状态机而不是一串裸 XHR：四种结局（成功 / 网络错误 / 超时 / 被中止）里任何一种
+ * 都必须让 Promise 落地。少一个出口，`doUpload` 的循环就停在这一首，界面永远停在最后一个百分比。
+ *
+ * @param {object} p
+ * @param {string} p.roomId
+ * @param {string} p.token
+ * @param {File} p.file
+ * @param {number} [p.duration]
+ * @param {string} [p.folder]
+ * @param {{ maxUpload:number, formats:string[] }} [p.limits] `/api/health` 带回来的上限与格式；取不到时不传
+ * @param {(s:{phase:string,pct:number,retry:number,received:number,total:number})=>void} [p.onState]
+ * @param {{ createXhr?:Function, now?:Function, setTimer?:Function, clearTimer?:Function }} [deps]
+ *   测试缝：默认全部回落生产实现，不传时行为与线上完全一致
+ */
+export function uploadTrack(p, deps = {}) {
+  const { roomId, token = "", file, duration = 0, folder = "", limits = null, onState } = p || {};
+  const createXhr = deps.createXhr || (() => new XMLHttpRequest());
+  const now = deps.now || (() => Date.now());
+  const setTimer = deps.setTimer || ((fn, ms) => setTimeout(fn, ms));
+  const clearTimer = deps.clearTimer || ((t) => clearTimeout(t));
+
   const base = `${apiBase()}/api/rooms/${encodeURIComponent(roomId)}`;
   const qs = new URLSearchParams({
     id: uploadId(),
@@ -109,22 +143,62 @@ export function uploadTrack({ roomId, token, file, duration, folder, onProgress 
     folder: folder || "",
   });
   const total = file.size || 0;
-  const report = (v) => {
+  const wait = (ms) => new Promise((r) => setTimer(r, ms));
+
+  // 当前这一步重试了几次；分片与收尾各自从 0 起算
+  let retry = 0;
+
+  const emit = (state) => {
     try {
-      onProgress?.(Math.max(0, Math.min(1, v)));
+      onState?.(state);
     } catch {}
   };
+  /** 已收字节换算成进度：传输与收尾共用 0.99 的上限，100% 只留给 done。 */
+  const pctOf = (received) =>
+    Math.min(PCT_CAP, (Math.max(0, Math.min(total, Number(received) || 0)) / (total || 1)) * PCT_CAP);
+  const failWith = (err, phase, received) => Object.assign(err, { phase, pct: pctOf(received), retry });
 
-  // 发一片；网络错误标记 net，服务端 4xx 带 status，交由外层决定重试还是放弃
+  // 发一个请求。四个出口全挂上：成功 / 网络错误 / 超时 / 被中止。
+  // 少了 onabort 这一个，浏览器中止请求时 Promise 永不落地 —— 那正是「停在 100% 不动」的样子。
   const post = (url, body) =>
     new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
+      const xhr = createXhr();
+      let settled = false;
+      let stalled = false;
+      let watch = null;
+      let lastByte = now();
+
+      const stopWatch = () => {
+        if (watch) clearTimer(watch);
+        watch = null;
+      };
+      const finish = (fn, val) => {
+        if (settled) return;
+        settled = true;
+        stopWatch();
+        fn(val);
+      };
+      // 看门狗从「最后一次字节推进」起算，不是从请求开始：慢但还在动的连接不该被掐断
+      const armWatch = () => {
+        stopWatch();
+        watch = setTimer(() => {
+          watch = null;
+          if (settled) return;
+          stalled = true;
+          try {
+            xhr.abort();
+          } catch {}
+        }, Math.max(0, STALL_MS - (now() - lastByte)));
+      };
+
       xhr.open("POST", url);
-      xhr.timeout = 240000;
+      xhr.timeout = REQ_TIMEOUT;
       xhr.setRequestHeader("Authorization", `Bearer ${token}`);
       if (body) {
         xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) report((body.offset + e.loaded) / (total || 1));
+          lastByte = now();
+          armWatch();
+          if (e.lengthComputable) body.onBytes?.(e.loaded);
         };
       }
       xhr.onload = () => {
@@ -132,63 +206,124 @@ export function uploadTrack({ roomId, token, file, duration, folder, onProgress 
         try {
           data = JSON.parse(xhr.responseText);
         } catch {}
-        if (xhr.status >= 200 && xhr.status < 300) return resolve(data || {});
-        reject(Object.assign(new Error(data?.error || `上传失败 (${xhr.status})`), { status: xhr.status, body: data }));
+        if (xhr.status >= 200 && xhr.status < 300) return finish(resolve, data || {});
+        finish(reject, Object.assign(new Error(data?.error || `上传失败 (${xhr.status})`), { status: xhr.status, body: data }));
       };
-      xhr.onerror = () => reject(Object.assign(new Error("网络错误"), { net: true }));
-      xhr.ontimeout = () => reject(Object.assign(new Error("网络超时"), { net: true }));
+      xhr.onerror = () => finish(reject, Object.assign(new Error("网络错误"), { net: true }));
+      // 30 秒一点回音都没有：对用户来说和「连接停滞」是同一件事
+      xhr.ontimeout = () => finish(reject, Object.assign(new Error("网络超时"), { net: true, stall: true }));
+      xhr.onabort = () =>
+        stalled
+          ? finish(reject, Object.assign(new Error("连接停滞"), { net: true, stall: true }))
+          : finish(reject, Object.assign(new Error("上传已中止"), { aborted: true }));
+
+      armWatch();
       xhr.send(body ? body.blob : undefined);
     });
 
   return (async () => {
+    // ---------- 发送前校验：第一个请求之前判完，判不过就零请求、零状态帧 ----------
+    const extMatch = /\.([^.\\/]+)$/.exec(String(file.name || ""));
+    const ext = extMatch ? extMatch[0].toLowerCase() : "";
+    if (!total) throw failWith(new Error("文件是空的（0 字节）"), "prepare", 0);
+    if (limits) {
+      const formats = limits.formats || [];
+      if (!formats.includes(ext)) {
+        const list = formats.map((f) => f.replace(/^\./, "")).join(" / ");
+        throw failWith(new Error(`不支持的格式（${ext || "没有扩展名"}），只能上传 ${list}`), "prepare", 0);
+      }
+      if (total > limits.maxUpload) {
+        throw failWith(
+          new Error(`文件 ${sizeMB(total)}MB 超过上限 ${sizeMB(limits.maxUpload)}MB`),
+          "prepare",
+          0
+        );
+      }
+    }
+
+    emit({ phase: "prepare", pct: 0, retry: 0, received: 0, total });
+
+    // ---------- 分片 ----------
     let offset = 0;
-    let tries = 0;
     let restarts = 0;
+    retry = 0;
 
     while (offset < total) {
       const end = Math.min(offset + UPLOAD_CHUNK, total);
       const blob = file.slice(offset, end);
       try {
-        const r = await post(`${base}/tracks/chunk?${qs}&offset=${offset}`, { blob, offset });
+        const r = await post(`${base}/tracks/chunk?${qs}&offset=${offset}`, {
+          blob,
+          onBytes: (loaded) =>
+            emit({
+              phase: "sending",
+              pct: pctOf(offset + loaded),
+              retry,
+              received: Math.min(total, offset + loaded),
+              total,
+            }),
+        });
         const got = Number(r.received);
         offset = Number.isFinite(got) ? Math.min(got, total) : end;
-        tries = 0;
-        report(offset / (total || 1));
+        retry = 0;
+        emit({ phase: "sending", pct: pctOf(offset), retry: 0, received: offset, total });
       } catch (err) {
+        // 浏览器把请求中止了（面板被关、扩展被重挂）：这一首到此为止，但流程要继续走
+        if (err.aborted) throw failWith(err, "sending", offset);
         // 服务端说「你已经传到这里了」：接着传
         if (err.status === 409 && Number.isFinite(err.body?.received)) {
           offset = Math.min(err.body.received, total);
-          tries = 0;
+          retry = 0;
           continue;
         }
         // 服务端重启过，半截文件没了：从头再来一次
         if (err.status === 410 && restarts++ < 1) {
           offset = 0;
-          tries = 0;
+          retry = 0;
           continue;
         }
-        if (!err.net && !(err.status >= 500)) throw err;
-        if (++tries > 4) {
-          const pct = total ? Math.round((offset / total) * 100) : 0;
-          throw new Error(`网络不稳定，重试多次仍未成功（已传 ${pct}%）`);
+        if (!err.net && !(err.status >= 500)) throw failWith(err, "sending", offset);
+        // 这一步已经试过 retry+1 次：再失败就进终态（含首次共 5 次尝试）
+        if (retry >= RETRY_MAX) {
+          const pct = Math.round(pctOf(offset) * 100);
+          throw failWith(
+            new Error(`网络不稳定，重试多次仍未成功（${PHASE_TEXT.sending}，已传 ${pct}%，重试 ${RETRY_MAX} 次）`),
+            "sending",
+            offset
+          );
         }
-        await sleep(600 * tries);
+        retry++;
+        // 停滞要单独说一声：界面上的「连接停滞，正在重试第 N 次」就是这一帧
+        if (err.stall) emit({ phase: "stalled", pct: pctOf(offset), retry, received: offset, total });
+        await wait(600 * retry);
       }
     }
 
-    // 收尾：整首都传完了，这一步更不能因为一次抖动就前功尽弃
-    let res = null;
-    for (let i = 0; ; i++) {
+    // ---------- 收尾：整首都传完了，这一步更不能因为一次抖动就前功尽弃 ----------
+    retry = 0;
+    emit({ phase: "committing", pct: PCT_CAP, retry: 0, received: total, total });
+    for (;;) {
       try {
-        res = await post(`${base}/tracks/commit?${qs}`, null);
-        break;
+        const res = await post(`${base}/tracks/commit?${qs}`, null);
+        emit({ phase: "done", pct: 1, retry: 0, received: total, total });
+        return res;
       } catch (err) {
-        if (i >= 3 || (!err.net && !(err.status >= 500))) throw err;
-        await sleep(700 * (i + 1));
+        if (err.aborted) throw failWith(err, "committing", total);
+        if (!err.net && !(err.status >= 500)) throw failWith(err, "committing", total);
+        if (retry >= RETRY_MAX) {
+          throw failWith(
+            new Error(
+              `收尾阶段重试多次仍未成功（${PHASE_TEXT.committing}，已传 ${Math.round(pctOf(total) * 100)}%，重试 ${RETRY_MAX} 次）`
+            ),
+            "committing",
+            total
+          );
+        }
+        retry++;
+        if (err.stall) emit({ phase: "stalled", pct: pctOf(total), retry, received: total, total });
+        await wait(700 * retry);
       }
     }
-    report(1);
-    return res;
   })();
 }
 

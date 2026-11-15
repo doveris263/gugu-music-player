@@ -53,6 +53,8 @@ export class Engine {
     })();
 
     this.skew = 0;
+    // 服务端的上传上限与格式白名单：/api/health 带回来存这里，界面读这份，不再自己请求一次
+    this.limits = null;
     this.src = "";
     this.pendingSeek = null;
     this.blocked = false;
@@ -206,8 +208,17 @@ export class Engine {
       const t0 = Date.now();
       const data = await (await fetch(`${apiBase()}/api/health`, { cache: "no-store" })).json();
       this.skew = data.time - (t0 + Date.now()) / 2;
+      const nextLimits = {
+        maxUpload: Number(data.maxUpload) || 0,
+        formats: Array.isArray(data.formats) ? data.formats : [],
+      };
+      // 上限与格式变了也要推一次：60 秒重取回来的新值不送到界面，等于白取
+      const limitsChanged = JSON.stringify(this.limits) !== JSON.stringify(nextLimits);
+      this.limits = nextLimits;
       if (!this.connected) {
         this.connected = true;
+        this.emitStatus();
+      } else if (limitsChanged) {
         this.emitStatus();
       }
     } catch {
@@ -670,6 +681,7 @@ export class Engine {
         claimError: this.claimError,
         volume: this.localVolume,
         error: this.audio.error ? `音频加载失败（${this.audio.error.code}）` : "",
+        limits: this.limits,
       },
     });
   }

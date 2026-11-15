@@ -28,6 +28,21 @@ const fmt = (sec) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 };
 const icon = (n) => `<span aria-hidden="true">${ICON[n] || ""}</span>`;
+const fmtSize = (n) => {
+  const v = Number(n) || 0;
+  if (v >= 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1)}MB`;
+  if (v >= 1024) return `${Math.round(v / 1024)}KB`;
+  return `${v}B`;
+};
+const fmtTime = (d) => {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
+const PHASE_TEXT = { prepare: "准备中", sending: "传输中", committing: "收尾中" };
+/** 玩家侧播放出错只给这一句（F10）：不拼接服务端原话，那里可能带内部字段名与错误码。 */
+const PLAY_ERROR_TEXT = "播放出了点问题，刷新页面再联系 GM 试试";
+/** 诊断只留最近 20 条，放内存里：跳刷新保留不在需求里，写盘的代价换不来场景。 */
+const DIAG_MAX = 20;
 
 const S = {
   upd: { current: "", latest: "", hasUpdate: false, autoUpdate: true, ready: false, readyVersion: "" },
@@ -41,8 +56,12 @@ const S = {
   skew: 0,
   tab: "list",
   busy: "",
-  uploading: null,
+  uploading: null, // 正在传的那一首：{ name, phase, pct, retry }
+  uploadDone: "", // 一批结束后的汇总：已完成 N 个，失败 M 个
+  failCard: null, // 最近一次失败，六行内容留到用户点 ×
+  diag: [], // 诊断环形缓冲（最近 20 条）
   notice: null,
+  playError: false, // 玩家侧那一句固定提示：播放出错时置 true，用户点 × 之后置回 false
   claimError: "",
   biliUrl: "",
   drag: null,
@@ -60,6 +79,103 @@ let engine = null;
 let heardBg = false;
 let lastSig = "";
 let queued = false;
+let sawConnected = false; // 见过「已连接」之后，断线才值得记一条诊断
+
+// ---------- 上限 / 格式 / 诊断 ----------
+/** 服务端的上限与格式：engine 读一次 `/api/health` 放进状态广播，这里读那份，不再自己请求。 */
+function limitsInfo() {
+  const lim = S.status?.limits;
+  return lim && Array.isArray(lim.formats) && lim.formats.length ? lim : null;
+}
+
+/** 上传阶段文字：准备中 / 传输中 / 第 N 次重试 / 连接停滞，正在重试第 N 次 / 收尾中。 */
+function uploadPhaseText(up) {
+  const pct = `${Math.floor((up.pct || 0) * 100)}%`;
+  if (up.phase === "prepare") return "准备中";
+  if (up.phase === "committing") return `收尾中 ${pct}`;
+  if (up.phase === "stalled") return `连接停滞，正在重试第 ${Math.max(1, up.retry)} 次（已传 ${pct}）`;
+  if (up.retry > 0) return `第 ${up.retry} 次重试 ${pct}`;
+  return `传输中 ${pct}`;
+}
+
+/** 记一条诊断：界面要看得到，服务端日志也留一份 —— 网络断了的时候只剩前者可用。 */
+function diag(stage, reason) {
+  S.diag.unshift({ at: Date.now(), stage: String(stage || ""), reason: String(reason || "") });
+  if (S.diag.length > DIAG_MAX) S.diag.length = DIAG_MAX;
+  report("diag", { stage, reason });
+  render();
+}
+
+/** 复制到剪贴板：先走标准接口；被 iframe 的权限策略拒了再用老办法，两条都不成就如实说。 */
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {}
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return Boolean(ok);
+  } catch {
+    return false;
+  }
+}
+
+/** 卡片上的六项（F5）：复制出去的文本与卡片同源，不另编一套。 */
+function failCardText(c) {
+  return [
+    `文件名：${c.name}`,
+    `大小：${c.sizeText}`,
+    `阶段：${c.phaseText}`,
+    `已传：${c.pctText}`,
+    `原因：${c.reason}`,
+    `时间：${c.timeText}`,
+  ].join("\n");
+}
+
+function failCardHtml() {
+  const c = S.failCard;
+  if (!c) return "";
+  return `<div class="failcard">
+    <div class="failcard-head">${icon("alert")}<span>上传失败</span><button class="x" data-act="fail-close" title="关闭">×</button></div>
+    <div class="fc-row"><span>文件名</span><span>${esc(c.name)}</span></div>
+    <div class="fc-row"><span>大小</span><span>${esc(c.sizeText)}</span></div>
+    <div class="fc-row"><span>阶段</span><span>${esc(c.phaseText)}</span></div>
+    <div class="fc-row"><span>已传</span><span>${esc(c.pctText)}</span></div>
+    <div class="fc-row"><span>原因</span><span>${esc(c.reason)}</span></div>
+    <div class="fc-row"><span>时间</span><span>${esc(c.timeText)}</span></div>
+    <button class="btn block" data-act="fail-copy" style="margin-top:8px">复制</button>
+  </div>`;
+}
+
+function diagText() {
+  return S.diag.map((d) => `${fmtTime(new Date(d.at))} · ${d.stage} · ${d.reason}`).join("\n");
+}
+
+function diagHtml() {
+  const rows = S.diag || [];
+  const list = rows.length
+    ? rows
+        .map(
+          (d) =>
+            `<div class="diag-row"><span class="diag-at">${esc(fmtTime(new Date(d.at)))}</span>` +
+            `<span class="diag-stage">${esc(d.stage)}</span><span class="diag-why">${esc(d.reason)}</span></div>`
+        )
+        .join("")
+    : `<div class="diag-empty">还没有错误记录</div>`;
+  return `<div class="section">诊断</div>
+  <div class="diag">${list}</div>
+  <div class="row2">
+    <button class="btn block" data-act="diag-copy" ${rows.length ? "" : "disabled"}>复制全部</button>
+    <button class="btn block" data-act="diag-clear" ${rows.length ? "" : "disabled"}>清空</button>
+  </div>`;
+}
 
 // ---------- 渲染 ----------
 function render(force) {
@@ -82,8 +198,16 @@ function render(force) {
       cover: S.now?.track?.cover,
       list: (S.state?.playlist || []).map((t) => t.id + t.title).join("|"),
       busy: S.busy,
-      up: S.uploading ? Math.round(S.uploading.pct * 20) + (S.uploading.done ? "d" : "") : "",
+      up: S.uploading ? `${S.uploading.phase}|${Math.round(S.uploading.pct * 100)}|${S.uploading.retry}` : "",
+      updone: S.uploadDone,
+      card: S.failCard ? `${S.failCard.name}|${S.failCard.timeText}` : "",
+      diag: S.diag?.length ? `${S.diag.length}|${S.diag[0].at}` : "",
+      // 上限与格式也是添加页的渲染输入：不跟踪它，拿到新值也不会重绘
+      limits: S.status?.limits
+        ? `${S.status.limits.maxUpload}|${(S.status.limits.formats || []).join(",")}`
+        : "",
       notice: S.notice?.text || "",
+      playErr: S.playError ? 1 : 0,
       claim: S.claimError,
       blocked: S.status.blocked,
       buffering: Boolean(S.status.buffering),
@@ -194,7 +318,7 @@ function gmView() {
     : S.upd?.hasUpdate
       ? `<div class="upd-banner"><span>发现新版本 ${esc(S.upd.latest)}</span><span class="upd-hint">${S.upd.autoUpdate ? "正在后台下载…" : "可在设置里手动更新"}</span></div>`
       : "";
-  return noticeHtml() + updTip + nowCard(true) + transport + blocked + tabs + body;
+  return noticeHtml() + failCardHtml() + updTip + nowCard(true) + transport + blocked + tabs + body;
 }
 
 /** 插件自带的确认框：OBR 的 iframe 里 window.confirm/prompt 会被静默屏蔽。 */
@@ -306,15 +430,31 @@ function listView(list) {
 
 function addView() {
   const up = S.uploading;
+  const lim = limitsInfo();
+  // 选择器的接受类型、下面那行文案、发送前校验，三处都出自同一份 formats
+  const accept = lim ? ` accept="${esc(lim.formats.join(","))}"` : "";
+  const formatsHint = lim ? lim.formats.map((f) => f.replace(/^\./, "")).join(" / ") : "";
   return `
   <div class="field">
-    <div class="label">本地音乐 <span class="hint">mp3 / m4a / ogg / wav</span></div>
+    <div class="label">本地音乐</div>
     <label class="drop" for="file">${icon("upload")}<div>点击选择，或把音频拖进来</div>
       <small>上传后全房间都能听到</small></label>
-    <input id="file" type="file" accept="audio/*,.mp3,.m4a,.ogg,.wav,.flac" multiple style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none" />
-    ${up ? `<div class="notice">${up.done ? "" : '<span class="spin"></span>'}<span>${
-      up.done ? `已完成 ${up.done} 个` : `${esc(up.name)} · ${Math.round(up.pct * 100)}%`
-    }</span></div>` : ""}
+    <input id="file" type="file"${accept} multiple style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none" />
+    ${
+      lim
+        ? `<div class="foot" style="text-align:left;padding-top:6px">单个文件上限 ${Math.round(
+            lim.maxUpload / 1024 / 1024
+          )}MB · 支持 ${esc(formatsHint)}</div>`
+        : ""
+    }
+    ${
+      up
+        ? `<div class="notice">${up.phase === "stalled" ? icon("alert") : '<span class="spin"></span>'}<span>${esc(
+            up.name
+          )} · ${esc(uploadPhaseText(up))}</span></div>`
+        : ""
+    }
+    ${S.uploadDone ? `<div class="notice"><span>${esc(S.uploadDone)}</span></div>` : ""}
   </div>
   <div class="field">
     <div class="label">B 站视频 <span class="hint">只取音轨</span></div>
@@ -363,7 +503,8 @@ function settingsView() {
     <button class="btn block" data-act="reclaim">重新取得控制权</button>
     <button class="btn block" data-act="release">让出控制权</button>
   </div>
-  <div class="foot">控制权靠心跳保持，关掉浏览器 90 秒后别人可接管。</div>`;
+  <div class="foot">控制权靠心跳保持，关掉浏览器 90 秒后别人可接管。</div>
+  ${diagHtml()}`;
 }
 
 function playerView() {
@@ -373,6 +514,11 @@ function playerView() {
   const canClaim = !S.now?.owner;
   return `
   ${nowCard(false)}
+  ${
+    S.playError
+      ? `<div class="notice err">${icon("alert")}<span>${PLAY_ERROR_TEXT}</span><button class="x" data-act="play-error-close" title="关闭">×</button></div>`
+      : ""
+  }
   ${S.status.blocked ? `<button class="unlock" data-act="unlock">${icon("volume")}开启声音</button>` : ""}
   ${
     canClaim
@@ -451,6 +597,7 @@ async function command(body) {
       else bus?.post({ t: "refresh" });
     }
   } catch (err) {
+    diag("服务器", err.message);
     toast(err.message, "err");
   }
 }
@@ -538,6 +685,7 @@ async function addBilibili() {
     toast("已加入歌单");
     await refreshState();
   } catch (err) {
+    diag("B 站解析", err.message);
     toast(err.message, "err");
   } finally {
     S.busy = "";
@@ -551,13 +699,17 @@ function activeFolder() {
 }
 
 async function doUpload(files) {
-  const list = [...files].filter((f) => /^audio\//.test(f.type) || /\.(mp3|m4a|aac|ogg|opus|wav|flac|webm)$/i.test(f.name));
+  const list = [...files];
   if (!list.length) return toast("请选择音频文件", "warn");
+  const lim = limitsInfo();
   let done = 0;
+  let failed = 0;
+  S.uploadDone = "";
   for (const file of list) {
+    const state = { name: file.name, phase: "prepare", pct: 0, retry: 0 };
+    S.uploading = state;
+    render(true);
     try {
-      S.uploading = { name: file.name, pct: 0 };
-      render(true);
       // 时长只用于显示；读不到（0）也要能上传，不能因为元数据卡住整批
       const duration = await mediaDuration(file).catch(() => 0);
       await uploadTrack({
@@ -566,30 +718,45 @@ async function doUpload(files) {
         token: token(),
         file,
         duration,
-        onProgress: (p) => {
-          S.uploading = { name: file.name, pct: p };
+        // 取不到 /api/health 就不传：格式与上限交给服务端判，前端不自己写一份
+        limits: lim || undefined,
+        onState: (s) => {
+          state.phase = s.phase;
+          state.pct = s.pct;
+          state.retry = s.retry;
           render();
         },
       });
       done++;
     } catch (err) {
-      // 失败上报到服务端日志：下次再出现「偶尔失败」时，GM 的日志里能查到是哪一步
-      report("upload-fail", {
-        name: file.name,
-        size: file.size,
-        pct: Math.round((S.uploading?.pct || 0) * 100),
-        msg: String(err?.message || err),
-      });
-      toast(`${file.name}：${err.message}${err?.net ? "，重试一次通常就好" : ""}`, "err");
+      failed++;
+      showFailCard(file, err);
     }
   }
-  S.uploading = { name: "", pct: 1, done };
+  S.uploading = null;
+  S.uploadDone = `已完成 ${done} 个，失败 ${failed} 个`;
   render(true);
   setTimeout(() => {
-    S.uploading = null;
+    S.uploadDone = "";
     render(true);
-  }, 1500);
+  }, 6000);
   await refreshState();
+}
+
+/** 失败卡片（F5）：六行内容留到用户点 ×，同时记一条诊断。 */
+function showFailCard(file, err) {
+  const phase = err?.phase || "sending";
+  const phaseText = PHASE_TEXT[phase] || "传输中";
+  S.failCard = {
+    name: file.name || "音频",
+    sizeText: fmtSize(file.size),
+    phaseText,
+    pctText: `${Math.round((err?.pct || 0) * 100)}%`,
+    reason: String(err?.message || err),
+    timeText: fmtTime(new Date()),
+  };
+  diag("上传", `${S.failCard.name}（${phaseText}）：${S.failCard.reason}`);
+  render(true);
 }
 
 // ---------- 事件 ----------
@@ -601,6 +768,7 @@ document.addEventListener("click", (ev) => {
 
   if (act === "tab") S.tab = el.dataset.tab;
   else if (act === "dismiss") S.notice = null;
+  else if (act === "play-error-close") S.playError = false;
   else if (act === "toggle") command({ type: S.now?.playback?.playing ? "pause" : "play" });
   else if (act === "prev") command({ type: "prev" });
   else if (act === "next") command({ type: "next" });
@@ -611,6 +779,18 @@ document.addEventListener("click", (ev) => {
   else if (act === "add-bili") addBilibili();
   else if (act === "toggle-hide") command({ type: "settings", hideTitle: !S.state?.settings?.hideTitle });
   else if (act === "unlock") bus?.post({ t: "unlock" });
+  else if (act === "fail-copy") {
+    copyText(failCardText(S.failCard || {})).then((ok) =>
+      toast(ok ? "已复制，直接粘给开发者就行" : "复制失败，请手动选中卡片文字", ok ? "info" : "err")
+    );
+    return;
+  } else if (act === "fail-close") S.failCard = null;
+  else if (act === "diag-copy") {
+    copyText(diagText()).then((ok) =>
+      toast(ok ? "已复制全部诊断" : "复制失败，请手动选中诊断文字", ok ? "info" : "err")
+    );
+    return;
+  } else if (act === "diag-clear") S.diag = [];
   else if (act === "reclaim") claim();
   else if (act === "release") {
     askConfirm("让出控制权？其他 GM 可以接管。", null, "release");
@@ -854,8 +1034,9 @@ document.addEventListener("change", (ev) => {
   }
 });
 
-// 拖拽：在面板任何位置松手都算，不再要求精确落在那个虚线框里
-const isAudioFile = (f) => /^audio\//.test(f.type || "") || /\.(mp3|m4a|aac|ogg|opus|wav|flac|webm)$/i.test(f.name || "");
+// 拖拽：在面板任何位置松手都算，不再要求精确落在那个虚线框里。
+// 这里不再预筛格式：能不能传只由 uploadTrack 的发送前校验判一次，判不过的文件给出错误卡片，
+// 而不是被默默滤掉。
 document.addEventListener("dragover", (ev) => {
   if (![...(ev.dataTransfer?.types || [])].includes("Files")) return;
   ev.preventDefault();
@@ -873,9 +1054,7 @@ document.addEventListener("drop", (ev) => {
     toast("没有读取到文件，请用「添加」里的选择文件", "warn");
     return;
   }
-  const audio = files.filter(isAudioFile);
-  if (!audio.length) return toast("只能拖入音频文件（mp3 / m4a / ogg / wav / flac）", "warn");
-  doUpload(audio);
+  doUpload(files);
 });
 
 async function loadUpdateState() {
@@ -939,14 +1118,40 @@ function onBus(msg) {
       S.state = msg.state;
       render();
       break;
-    case "status":
+    case "status": {
+      // 上一次广播里有没有播放错误：下面要按「从没有变成有」触发，不能每帧都弹
+      const hadError = Boolean(S.status?.error);
       S.status = msg.status || {};
-      if (msg.status?.role && msg.status.role !== S.role) S.role = msg.status.role;
+      if (msg.status?.role && msg.status.role !== S.role) {
+        const wasGM = S.role === "GM";
+        S.role = msg.status.role;
+        // 角色切成 GM 时把玩家那句提示一并清掉：GM 视图不渲染它，关闭键也只在玩家视图，
+        // 标记会一直挂着；之后切回玩家，就会把一条早已过去的提示顶到眼前。
+        if (!wasGM && S.role === "GM") S.playError = false;
+      }
       if (msg.status?.hasToken) S.claimError = "";
+      // 玩家自己那台播放器的错误（引擎把 `音频加载失败（code）` 放在 status.error 里）也必须到玩家眼前，
+      // 而原文只给 GM 的设置页 —— 玩家侧只拿那句固定提示。边沿触发：错误一直挂着不重复弹，
+      // 用户点 × 之后不会被下一帧广播顶回来，等下一次真出错再出现。
+      if (S.role !== "GM" && S.status.error && !hadError) S.playError = true;
+      // 连接断了也要在诊断里留一条：以前只把状态点变黄，界面上没有任何可读原因。
+      // 引擎刚起来时首帧就是未连接，那不是「断了」，要真连上过才记。
+      if (S.status.connected) sawConnected = true;
+      else if (sawConnected) {
+        sawConnected = false;
+        diag("同步连接", "和服务端的连接断了");
+      }
       render();
       break;
+    }
     case "error":
-      toast(msg.error, "err");
+      // 玩家视图不渲染 S.notice，toast 到不了玩家眼前；而 msg.error 是服务端原话，
+      // 可能带内部字段名与错误码，F10 不许它出现在玩家侧 —— 玩家只拿那一句固定提示。
+      if (S.role === "GM") toast(msg.error, "err");
+      else {
+        S.playError = true;
+        render(true);
+      }
       break;
   }
 }

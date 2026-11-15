@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "phase": "initial-dev",
+  "docRoot": {
+    "requirements": "docs/requirements",
+    "specs": "docs/requirements/specs",
+    "design": "docs/design",
+    "modules": "docs/design/modules",
+    "batches": "docs/batches",
+    "standards": null
+  },
+  "codePaths": [
+    "src"
+  ],
+  "index": {
+    "codeExtensions": [],
+    "docExtensions": [],
+    "excludePaths": [],
+    "publicRepos": []
+  }
+}

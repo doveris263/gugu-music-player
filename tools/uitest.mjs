@@ -312,7 +312,7 @@ async function main() {
       const file = new File([buf], '浏览器上传.wav', { type: 'audio/wav' });
       const token = localStorage.getItem('bard:token:${ROOM}');
       if (!token) return 'no-token';
-      await lib.uploadTrack({ roomId: '${ROOM}', token, file, duration: 1, onProgress() {} });
+      await lib.uploadTrack({ roomId: '${ROOM}', token, file, duration: 1 });
       return 'ok';
     })()`);
     check("页面上传本地音频成功", uploaded === "ok", `结果=${uploaded}`);

@@ -285,3 +285,55 @@ input[type="range"]::-webkit-slider-thumb { appearance: none; width: 13px; heigh
 }
 .upd-banner.ready { background: rgba(120,200,140,0.12); border-color: rgba(120,200,140,0.35); color: #8fd6a2; }
 .upd-hint { font-size: 10.5px; opacity: 0.8; }
+
+/* ---------- 上传失败卡片（F5）---------- */
+.failcard {
+  margin: 8px 0 12px;
+  padding: 10px 12px 11px;
+  border-radius: 12px;
+  border: 1px solid rgba(224, 108, 117, 0.35);
+  background: rgba(224, 108, 117, 0.08);
+}
+.failcard-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #f0b6bb;
+  margin-bottom: 7px;
+}
+.failcard-head svg { width: 14px; height: 14px; flex: none; }
+.failcard-head .x { margin-left: auto; color: var(--dim2); }
+.fc-row {
+  display: flex;
+  gap: 10px;
+  padding: 2px 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.fc-row span:first-child { flex: none; width: 54px; color: var(--dim2); }
+.fc-row span:last-child { flex: 1; min-width: 0; color: #f0d6d8; word-break: break-all; }
+
+/* ---------- 诊断区块（F8，只在设置页、只有 GM 看得到）---------- */
+.diag {
+  max-height: 168px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.22);
+  padding: 4px;
+}
+.diag-row {
+  display: flex;
+  gap: 7px;
+  padding: 4px 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+.diag-row + .diag-row { border-top: 1px solid rgba(255, 255, 255, 0.05); }
+.diag-at { flex: none; color: var(--dim2); font-variant-numeric: tabular-nums; }
+.diag-stage { flex: none; color: var(--gold); }
+.diag-why { flex: 1; min-width: 0; word-break: break-all; }
+.diag-empty { padding: 10px 6px; font-size: 11px; color: var(--dim2); }
