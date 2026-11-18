@@ -424,7 +424,7 @@ route("POST", "/api/rooms/:room/claim", async (req, res, p) => {
   const body = await readJson(req);
   const result = store.claim(p.room, {
     clientId: String(body.clientId || ""),
-    name: String(body.name || "GM"),
+    name: String(body.name || "DM"),
     token: String(body.token || ""),
     adminKey: String(body.adminKey || ""),
     requiredKey: ADMIN_KEY,
@@ -918,6 +918,22 @@ function parseCsv(text) {
   return rows.filter((r) => r.some((c) => String(c).trim() !== ""));
 }
 
+/** 把表格字节解成文本：BOM 优先，否则先试严格 UTF-8，失败再按 GB18030 解。
+    Excel 在中文 Windows 上默认另存的「CSV（逗号分隔）」就是 GBK，
+    按 UTF-8 硬读会把表头读成乱码，服务端就认不出「曲名」「类型」两列。 */
+function decodeCsvBytes(buf) {
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    return buf.subarray(3).toString("utf8");
+  }
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) return new TextDecoder("utf-16le").decode(buf.subarray(2));
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) return new TextDecoder("utf-16be").decode(buf.subarray(2));
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    return new TextDecoder("gb18030").decode(buf);
+  }
+}
+
 route("GET", "/api/rooms/:room/export", (req, res, p, search) => {
   const room = guard(req, res, p.room, bearer(req, search));
   if (!room) return;
@@ -959,24 +975,42 @@ route("POST", "/api/rooms/:room/import", async (req, res, p, search) => {
   } catch {
     body = null;
   }
-  const csv = body && typeof body.csv === "string" ? body.csv : "";
+  // 前端传的是原始字节（base64），编码在这里判：BOM → UTF-8 → GB18030
+  let csv = "";
+  if (body && typeof body.csvBase64 === "string" && body.csvBase64) {
+    try {
+      csv = decodeCsvBytes(Buffer.from(body.csvBase64, "base64"));
+    } catch {
+      return json(req, res, 400, { error: "表格内容读不出来：编码无法识别，请另存为「CSV UTF-8」再试" });
+    }
+  } else if (body && typeof body.csv === "string") {
+    csv = body.csv;
+  }
   if (!csv.trim()) return json(req, res, 400, { error: "没有收到表格内容" });
 
   const rows = parseCsv(csv);
   if (rows.length < 2) return json(req, res, 400, { error: "表格里没有数据行" });
   const head = rows[0].map((h) => String(h).trim());
-  const col = (name) => head.indexOf(name);
-  const cTitle = col("曲名");
-  const cType = col("类型");
+  // 表头容错：别的工具导出的表常写「歌名」「类别」「地址」，认下来免得用户手动改表头
+  const colAny = (...names) => {
+    for (const n of names) {
+      const i = head.indexOf(n);
+      if (i >= 0) return i;
+    }
+    return -1;
+  };
+  const cTitle = colAny("曲名", "歌名", "歌曲名", "名称", "标题");
+  const cType = colAny("类型", "类别", "格式");
   if (cTitle < 0 || cType < 0) {
-    return json(req, res, 400, { error: "表格缺列：至少要「曲名」和「类型」。请用本程序导出的表格当模板" });
+    return json(req, res, 400, {
+      error: `表格缺列：至少要「曲名」和「类型」。当前表头读到的是：${head.join(" / ") || "（空）"}`,
+    });
   }
-  const cArtist = col("歌手");
-  const cFolder = col("分类");
-  const cLink = col("链接");
-  const cDur = col("时长");
-  const cKey = col("文件标识");
-  const pick = (r, i) => (i >= 0 && r[i] !== undefined ? String(r[i]).trim() : "");
+  const cArtist = colAny("歌手", "作者", "艺人");
+  const cFolder = colAny("分类", "文件夹", "歌单");
+  const cLink = colAny("链接", "地址", "url", "URL");
+  const cDur = colAny("时长", "长度");
+  const cKey = colAny("文件标识", "文件名", "标识");
 
   // 导入改成「任务 + 轮询」。以前是一条 NDJSON 长连接，一面处理一面往下推：
   // 中间任何一层代理缓冲、或者连接被提前关掉，前端就直接 Failed to fetch，进度停在原地。
@@ -1031,17 +1065,43 @@ async function runImportJob(job, roomId, rows, cols) {
   const skipped = [];
   const failed = [];
 
+  // 表里写了目标房间没有的分类时，旧行为是 addTrack 里静默清空（folder 不在 room.folders 就去掉），
+  // 结果是导入报「新增 28 首」而分类全丢，没人会发现。这里按表新建分类，并把名单回给前端。
+  const createdFolders = [];
+  const folderFor = (raw) => {
+    const name = cleanFolder(raw);
+    if (!name) return "";
+    if (!room.folders.includes(name)) {
+      room.folders.push(name);
+      createdFolders.push(name);
+    }
+    return name;
+  };
+
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     const title = pick(r, cTitle);
     const line = i + 1;
     const nA = added.length,
       nS = skipped.length;
-    const typeText = pick(r, cType).toLowerCase();
-    const isBili = /站|bilibili/.test(typeText);
-    const isUrlKind = !isBili && /url|直链|链接/.test(typeText);
+    // 类型列只当提示，真正的判据是「链接长什么样」：
+    // 有的表格在这一列写的是文件格式（mp3 / flac），照字面分类会把直链误判成缺文件的本地曲目。
+    const label = pick(r, cType).toLowerCase();
+    const keyRaw = pick(r, cKey);
+    const linkRaw = pick(r, cLink);
+    const httpish = /^https?:\/\//i.test(linkRaw) || /^https?:\/\//i.test(keyRaw);
+    const biliish =
+      /bilibili\.com|b23\.tv/i.test(linkRaw) ||
+      /bilibili\.com|b23\.tv/i.test(keyRaw) ||
+      /^BV[0-9A-Za-z]+$/i.test(String(keyRaw).split("#")[0] || "");
+    const kind =
+      /站|bilibili|b23/.test(label) || biliish
+        ? "bilibili"
+        : /url|直链|链接|http/.test(label) || httpish
+          ? "url"
+          : "local";
     try {
-      if (isUrlKind) {
+      if (kind === "url") {
         // 通用直链：表里「链接」列就是地址本身，导入时不用重新解析，只做格式校验
         const link = pick(r, cLink) || pick(r, cKey);
         if (!link) {
@@ -1064,27 +1124,27 @@ async function runImportJob(job, roomId, rows, cols) {
             ...made,
             artist: pick(r, cArtist) || made.artist,
             duration: Number(pick(r, cDur)) || 0,
-            folder: cleanFolder(pick(r, cFolder)),
+            folder: folderFor(pick(r, cFolder)),
           })
         );
         haveUrl.add(made.url);
-      } else if (isBili) {
-        const keyRaw = String(pick(r, cKey) || "");
-        const cidHint = keyRaw.includes("#") ? keyRaw.split("#")[1].trim() : "";
-        const link = pick(r, cLink) || `https://www.bilibili.com/video/${keyRaw.split("#")[0]}`;
+      } else if (kind === "bilibili") {
+        const key = String(keyRaw || "");
+        const cidHint = key.includes("#") ? key.split("#")[1].trim() : "";
+        const link = linkRaw || `https://www.bilibili.com/video/${key.split("#")[0]}`;
         if (!/bilibili|b23/.test(link)) {
           failed.push({ line, title, reason: "B 站行缺少可用链接" });
           continue;
         }
         // 用表格里的 cid 反查分P：链接里只有视频号，照它解析会还原成第 1P
         const parsed = await resolveBilibili(link, { cidHint });
-        const key = `${parsed.bvid || ""}#${parsed.cid || ""}`;
-        if (haveBili.has(key)) {
+        const biliKey = `${parsed.bvid || ""}#${parsed.cid || ""}`;
+        if (haveBili.has(biliKey)) {
           skipped.push({ line, title: parsed.title });
           continue;
         }
-        added.push(store.addTrack(roomId, { ...parsed, folder: cleanFolder(pick(r, cFolder)) }));
-        haveBili.add(key);
+        added.push(store.addTrack(roomId, { ...parsed, folder: folderFor(pick(r, cFolder)) }));
+        haveBili.add(biliKey);
       } else {
         const raw = pick(r, cKey) || pick(r, cLink);
         const fileName = path.basename(String(raw || ""));
@@ -1120,7 +1180,7 @@ async function runImportJob(job, roomId, rows, cols) {
             mime: audioMimeFor(fileName),
             size,
             duration: Number(pick(r, cDur)) || 0,
-            folder: cleanFolder(pick(r, cFolder)),
+            folder: folderFor(pick(r, cFolder)),
           })
         );
         haveLocal.add(fileName);
@@ -1142,7 +1202,8 @@ async function runImportJob(job, roomId, rows, cols) {
   }
 
   if (added.length) publish(roomId);
-  job.details = { skipped, failed };
+  if (createdFolders.length) store.save(roomId);
+  job.details = { skipped, failed, createdFolders };
   job.finished = true;
   job.at = Date.now();
 }

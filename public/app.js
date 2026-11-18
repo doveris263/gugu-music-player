@@ -46,7 +46,7 @@ const DIAG_MAX = 20;
 /** 前端构建标记：改了 public/ 下的前端代码就顺手改这里。
     浏览器把旧 app.js 留在内存里时，界面看上去一切正常但新功能就是不出现，
     这个字符串显示在「设置 → 诊断」里，一眼就能分清是代码没生效还是浏览器没刷新。 */
-const APP_BUILD = "2026-11-18 17:30";
+const APP_BUILD = "2026-11-18 21:05";
 
 const S = {
   upd: { current: "", latest: "", hasUpdate: false, autoUpdate: true, ready: false, readyVersion: "" },
@@ -251,7 +251,10 @@ function noticeHtml() {
       S.notice.text
     )}</span><button class="x" data-act="dismiss">×</button></div>`;
   }
-  if (S.role === "GM" && S.claimError) return `<div class="notice err">${icon("alert")}<span>${esc(S.claimError)}</span></div>`;
+  if (S.role === "GM" && S.claimError)
+    return `<div class="notice err">${icon("alert")}<span>${esc(
+      S.claimError
+    )}</span><button class="x" data-act="reclaim" title="重新取得控制权">↻</button></div>`;
   if (S.status.error) return `<div class="notice err">${icon("alert")}<span>${esc(S.status.error)}</span></div>`;
   return "";
 }
@@ -605,13 +608,102 @@ function toast(text, kind = "info", ms = 4000) {
 
 const token = () => lsGet(tokenKey(S.roomId), "") || "";
 
+// ---------- 控制权自愈 ----------
+// 房间同一时刻只认一个主持令牌。同一个房间可能在两个地方开着（本机地址和隧道地址、两个浏览器窗口），
+// 两边的 localStorage 互不相通，后来的那边就拿着一个过期令牌，做什么都收到 403「不是本房间的主持」。
+// 那种情况下用户什么错都没犯，所以这里不报错：先自己重新认领一次，真拿不到再把话说清楚。
+const clientKey = (roomId) => `bard:client:${roomId}`;
+
+function clientId() {
+  let id = lsGet(clientKey(S.roomId), "");
+  if (!id) {
+    id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    lsSet(clientKey(S.roomId), id);
+  }
+  return id;
+}
+
+/** 重新认领主持权。成功换新令牌；失败就把人话写进 claimError，界面顶部会显示。 */
+async function renewOwner() {
+  try {
+    const res = await apiPost(`/api/rooms/${encodeURIComponent(S.roomId)}/claim`, {
+      role: "GM",
+      clientId: clientId(),
+      token: token(),
+    });
+    if (res?.token) {
+      lsSet(tokenKey(S.roomId), res.token);
+      S.claimError = "";
+      render(true);
+      return true;
+    }
+  } catch (err) {
+    S.claimError = describeOwnerBlock(err);
+    // 顶部提示条会被引擎随后推来的状态清掉，所以再用 toast 说一遍：这条一定落到用户眼里
+    toast(S.claimError, "err", 7000);
+    render(true);
+  }
+  return false;
+}
+
+/** 房间被占时的提示：名字后面永远标上「DM」，免得把角色名（GM/DM）误认成某个人。 */
+function describeOwnerBlock(err) {
+  const o = err.body?.owner;
+  if (!o) return err.message || "控制权失效，请重新取得控制权";
+  const who = `「${o.name || "DM"}」（DM）`;
+  // 占着房间的就是自己另开的窗口（本页、浮窗、OBR 背景引擎）：不说怪话，只说实情
+  if (o.clientId && o.clientId === clientId())
+    return `控制权在你自己的另一个窗口上（${who}）。点 ↻ 或等它释放就能在这里操作。`;
+  return `这个房间正由 ${who} 控制；如果那是你自己刚刷新/关掉的窗口，最多 90 秒自动释放，也可以直接点 ↻ 重新取得控制权。`;
+}
+
+/** 关页/刷新时把主持权交出去：否则旧令牌要掛到 90 秒超时才释放，下次打开就是一顿「房间已被控制」。
+    只有「确实是本页持有」才交：同一个房间的背景引擎可能拿着同一张令牌，本页一并交掉就会把正在放歌的那个踢下线。 */
+function releaseOnLeave() {
+  const t = token();
+  if (!t) return;
+  // owner 在 /state 和 now 里都有；哪个先到用哪个
+  const owner = S.state?.owner || S.now?.owner;
+  if (owner?.clientId && owner.clientId !== clientId()) return;
+  try {
+    fetch(`${apiBase()}/api/rooms/${encodeURIComponent(S.roomId)}/release`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${t}` },
+      keepalive: true,
+    }).catch(() => {});
+  } catch {}
+}
+
+/** 带令牌的读请求：和写请求一样，令牌过期先自愈一次再重试。 */
+async function apiGetAuth(path) {
+  try {
+    return await apiGet(path, token());
+  } catch (err) {
+    if (err.status !== 401 && err.status !== 403) throw err;
+    if (!(await renewOwner())) throw err;
+    return await apiGet(path, token());
+  }
+}
+
+/** 带令牌的写请求：令牌过期先自愈一次，再重试。 */
+async function apiPostAuth(path, body) {
+  try {
+    return await apiPost(path, body, token());
+  } catch (err) {
+    if (err.status !== 401 && err.status !== 403) throw err;
+    if (!(await renewOwner())) throw err;
+    return await apiPost(path, body, token());
+  }
+}
+
 async function command(body) {
   if (!token()) return toast("还没有控制权", "err");
   try {
-    const res = await apiPost(`/api/rooms/${encodeURIComponent(S.roomId)}/command`, body, token());
+    const res = await apiPostAuth(`/api/rooms/${encodeURIComponent(S.roomId)}/command`, body);
     if (res?.state) {
       S.state = res.state;
       render(true);
+      scheduleProbeDurations();
       // 面板立刻更新了，但真正出声的是后台引擎。
       // 把响应里的 now 直接推给它，省掉引擎再问一次服务器的往返；
       // 少了这一趟，切歌才没有迟滞感。
@@ -620,6 +712,12 @@ async function command(body) {
     }
   } catch (err) {
     diag("服务器", err.message);
+    // 403/401 不是用户做错了什么：这个房间正被另一个窗口控制。把话说明白，别把服务端原文丢给他。
+    if (err.status === 401 || err.status === 403) {
+      if (!S.claimError) S.claimError = describeOwnerBlock(err);
+      render(true);
+      return;
+    }
     toast(err.message, "err");
   }
 }
@@ -714,9 +812,106 @@ window.__bardSetFolder = (el) => {
 async function refreshState() {
   if (!token()) return;
   try {
-    S.state = await apiGet(`/api/rooms/${encodeURIComponent(S.roomId)}/state`, token());
+    S.state = await apiGetAuth(`/api/rooms/${encodeURIComponent(S.roomId)}/state`);
     render(true);
-  } catch {}
+    scheduleProbeDurations();
+  } catch (err) {
+    // 读不到状态就是「控制权不在手上」，不能静默吞掉：否则界面停在旧数据上，
+    // 看着一切正常，实际点什么都没反应
+    if (err.status === 401 || err.status === 403) {
+      if (!S.claimError) S.claimError = "控制权已失效：这个房间正被另一个窗口控制。点 ↻ 重新取得控制权。";
+      render(true);
+    }
+  }
+}
+
+// ---------- 时长补齐 ----------
+// 直链曲目入库时不知道有多长：表里那格是空的，服务端也不会去下载音频慢慢解码。
+// 浏览器自己能解码（和播放用的是同一套解码器），所以这里把整张歌单里缺时长的都探一遍，
+// 写回服务端，所有人立刻都有了。B 站曲目解析时接口就带了时长，不在此列。
+// 探过的记下来不重复探，正在播的那首交给播放引擎回填，免得和播放抢带宽。
+const probe = { busy: false, tried: new Set(), timer: 0 };
+
+function needsDuration(t) {
+  return Boolean(t?.id) && t.id !== S.now?.track?.id && !(Number(t.duration) > 0) && Boolean(t.src) && !probe.tried.has(t.id);
+}
+
+function scheduleProbeDurations() {
+  if (S.role !== "GM" || !token()) return;
+  if (!(S.state?.playlist || []).some(needsDuration)) return;
+  clearTimeout(probe.timer);
+  probe.timer = setTimeout(runProbeDurations, 1200);
+}
+
+/** 只读元数据，不下载整首：preload=metadata 只会拿开头一小段。 */
+function probeDuration(t) {
+  return new Promise((resolve) => {
+    const a = new Audio();
+    a.preload = "metadata";
+    a.muted = true;
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try {
+        a.removeAttribute("src");
+        a.load();
+      } catch {}
+      resolve(v);
+    };
+    const timer = setTimeout(() => finish(0), 15000);
+    a.addEventListener("loadedmetadata", () => {
+      const d = a.duration;
+      finish(Number.isFinite(d) && d > 1 && d < 86400 ? Math.round(d) : 0);
+    });
+    a.addEventListener("error", () => finish(0));
+    try {
+      a.src = new URL(t.src, apiBase()).href;
+    } catch {
+      finish(0);
+    }
+  });
+}
+
+async function runProbeDurations() {
+  if (probe.busy || S.role !== "GM" || !token()) return;
+  const list = (S.state?.playlist || []).filter(needsDuration);
+  if (!list.length) return;
+  probe.busy = true;
+  let changed = 0;
+  try {
+    // 一次补齐整张歌单，不是只挑几首：表里没写时长的曲目都该自己长出来
+    for (const t of list) {
+      if (!token()) break; // 控制权没了就别再发命令
+      probe.tried.add(t.id);
+      const d = await probeDuration(t);
+      if (d > 0) {
+        try {
+          const res = await apiPostAuth(`/api/rooms/${encodeURIComponent(S.roomId)}/command`, {
+            type: "track.update",
+            trackId: t.id,
+            patch: { duration: d },
+          });
+          if (res?.state) {
+            S.state = res.state;
+            changed++;
+            render(true); // 数字一个一个出现，用户能看见在推进
+          }
+        } catch (err) {
+          diag("时长", err.message);
+        }
+      }
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  } finally {
+    probe.busy = false;
+    if (changed) {
+      render(true);
+      toast(`已补齐 ${changed} 首的时长`);
+    }
+    scheduleProbeDurations();
+  }
 }
 
 // 控制权交给引擎处理：界面只发意图，否则引擎下一条状态会把角色覆盖回去
@@ -739,7 +934,7 @@ async function addBilibili() {
   S.busy = "bili";
   render(true);
   try {
-    await apiPost(`/api/rooms/${encodeURIComponent(S.roomId)}/${path}`, { url, folder: activeFolder() }, token());
+    await apiPostAuth(`/api/rooms/${encodeURIComponent(S.roomId)}/${path}`, { url, folder: activeFolder() });
     S.biliUrl = "";
     toast("已加入歌单");
     await refreshState();
@@ -815,13 +1010,26 @@ async function importPlaylistCsv(file) {
   render(true);
   let result = null;
   try {
-    const text = await file.text();
+    // 传原始字节：Excel 在中文 Windows 下默认另存为 GBK 编码的「CSV（逗号分隔）」，
+    // 用 file.text() 按 UTF-8 读会把表头读成乱码，服务端就认不出「曲名」「类型」两列。
+    // 编码判断交给服务端（BOM → UTF-8 → GB18030）。
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    const csvBase64 = btoa(bin);
     const room = encodeURIComponent(S.roomId);
     const res = await fetch(`${apiBase()}/api/rooms/${room}/import`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token()}` },
-      body: JSON.stringify({ csv: text }),
+      body: JSON.stringify({ csvBase64 }),
     });
+    // 403 = 令牌过期（另一个窗口接手了）：换一张令牌再导一次，不让用户自己去想办法
+    if (res.status === 401 || res.status === 403) {
+      if (!(await renewOwner())) throw new Error(S.claimError || "控制权失效，请重新取得控制权");
+      return importPlaylistCsv(file);
+    }
     const head = await res.json().catch(() => ({}));
     if (!res.ok || !head.jobId) throw new Error(head.error || `导入失败（${res.status}）`);
     mine.total = Number(head.total) || 0;
@@ -856,6 +1064,9 @@ async function importPlaylistCsv(file) {
     const parts = [`新增 ${r.added} 首`];
     if (r.skipped) parts.push(`跳过重复 ${r.skipped} 首`);
     if (r.failed) parts.push(`没进来 ${r.failed} 首`);
+    // 表格里写了房间里还没有的分类：导入时按表新建，这里把名字报出来，免得用户去目录里找
+    const madeFolders = r.details?.createdFolders || [];
+    if (madeFolders.length) parts.push(`新建分类 ${madeFolders.join("、")}`);
     toast(parts.join("，"), r.failed ? "warn" : "info", 6000);
     if (r.failed) {
       const lines = (r.details?.failed || []).slice(0, 5).map((f) => `第 ${f.line} 行「${f.title || "无标题"}」：${f.reason}`);
@@ -1320,6 +1531,8 @@ function applyBg() {
 
 async function boot() {
   applyBg();
+  // 关页/刷新先把主持权交出去，别让旧令牌挂到 90 秒超时才放
+  window.addEventListener("pagehide", releaseOnLeave);
   loadUpdateState().then(() => render(true)).catch(() => {});
   const { OBR, role, roomId, attempts, ready } = await initOBR();
   S.role = role;
@@ -1365,6 +1578,7 @@ function onBus(msg) {
     case "state":
       S.state = msg.state;
       render();
+      scheduleProbeDurations();
       break;
     case "status": {
       // 上一次广播里有没有播放错误：下面要按「从没有变成有」触发，不能每帧都弹
@@ -1378,6 +1592,9 @@ function onBus(msg) {
         if (!wasGM && S.role === "GM") S.playError = false;
       }
       if (msg.status?.hasToken) S.claimError = "";
+      // 引擎拿不到控制权时必须说给 GM 听：以前只存在引擎里，界面一片安静，
+      // 用户只看到「点了没反应」或者一句「不是本房间的主持」
+      else if (msg.status?.claimError && S.role === "GM") S.claimError = msg.status.claimError;
       // 玩家自己那台播放器的错误（引擎把 `音频加载失败（code）` 放在 status.error 里）也必须到玩家眼前，
       // 而原文只给 GM 的设置页 —— 玩家侧只拿那句固定提示。边沿触发：错误一直挂着不重复弹，
       // 用户点 × 之后不会被下一帧广播顶回来，等下一次真出错再出现。

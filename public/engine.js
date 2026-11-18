@@ -167,7 +167,7 @@ export class Engine {
   // ---------- 主持权 ----------
   async ensureOwner() {
     try {
-      const name = await this.OBR.player.getName().catch(() => "GM");
+      const name = await this.OBR.player.getName().catch(() => "DM");
       const res = await apiPost(`/api/rooms/${encodeURIComponent(this.roomId)}/claim`, {
         role: "GM",
         clientId: this.clientId,
@@ -183,7 +183,19 @@ export class Engine {
         report("claim-ok", { roomId: this.roomId, fresh: Boolean(res.fresh) });
       }
     } catch (err) {
-      this.claimError = err.body?.owner ? `房间当前由「${err.body.owner.name}」控制` : err.message || "无法取得控制权";
+      // 服务端明确不认这张令牌（401/403 过期、423 别人在主持）：本地就别再留着它，
+      // 否则界面上写着「控制权已取得」而实际每个请求都 403，用户完全看不出真相。
+      if (err.status === 401 || err.status === 403 || err.status === 423) {
+        this.token = "";
+        lsDel(tokenKey(this.roomId));
+      }
+      const o = err.body?.owner;
+      // 名字后面永远标上「DM」：不然一个叫 GM 的 OBR 昵称会被当成别人抢了房间
+      this.claimError = o
+        ? o.clientId && o.clientId === this.clientId
+          ? `控制权在你自己的另一个窗口上（「${o.name || "DM"}」（DM））`
+          : `房间正由「${o.name || "DM"}」（DM）控制`
+        : err.message || "无法取得控制权";
       this.emitStatus();
       report("claim-fail", { roomId: this.roomId, error: this.claimError, status: err.status });
     }
@@ -658,9 +670,29 @@ export class Engine {
 
   async command(body) {
     if (!this.token) return;
+    const url = `/api/rooms/${encodeURIComponent(this.roomId)}/command`;
     try {
-      await apiPost(`/api/rooms/${encodeURIComponent(this.roomId)}/command`, body, this.token);
+      await apiPost(url, body, this.token);
     } catch (err) {
+      // 令牌失效先自己换一张再重试：同一个 clientId 认领回来还是同一个主持人。
+      // 直接把「不是本房间的主持」甩给用户没有意义——他并没有做错什么，
+      // 常见情况是同一个房间在另一个窗口里也开着，两边的 localStorage 不通。
+      if (err.status === 401 || err.status === 403) {
+        this.token = "";
+        lsDel(tokenKey(this.roomId));
+        await this.ensureOwner();
+        if (this.token) {
+          try {
+            await apiPost(url, body, this.token);
+            return;
+          } catch (err2) {
+            this.bus.post({ t: "error", error: err2.message || "指令失败" });
+            return;
+          }
+        }
+        this.bus.post({ t: "error", error: this.claimError || "控制权已被其他窗口接管，点「重新取得控制权」抢回来" });
+        return;
+      }
       this.bus.post({ t: "error", error: err.message || "指令失败" });
     }
   }

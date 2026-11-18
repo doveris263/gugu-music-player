@@ -129,7 +129,7 @@ export class Store {
     room.owner = {
       token: uid(24),
       clientId,
-      name: String(name || "GM").slice(0, 32),
+      name: String(name || "DM").slice(0, 32),
       claimedAt: Date.now(),
       heartbeatAt: Date.now(),
     };
@@ -318,6 +318,12 @@ export class Store {
         if (cmd.patch?.artist !== undefined) {
           patch.artist = String(cmd.patch.artist).replace(/\s+/g, " ").trim().slice(0, 24);
         }
+        // 时长：直链/导入曲目入库时不知道有多长，由播放端读到元数据后回填。
+        // 没有它列表显示空白、进度条也拖不动；越界值直接忽略，免得脏数据把时间轴搞乱。
+        if (cmd.patch?.duration !== undefined) {
+          const d = Math.round(Number(cmd.patch.duration));
+          if (Number.isFinite(d) && d > 0 && d <= 24 * 3600) patch.duration = d;
+        }
         if (!Object.keys(patch).length) return { ok: true };
         freeze();
         if (!this.updateTrack(roomId, String(cmd.trackId), patch)) return { ok: false, error: "曲目不存在" };
@@ -403,7 +409,9 @@ export class Store {
 }
 
 export function publicOwner(room) {
-  return room.owner ? { name: room.owner.name, since: room.owner.claimedAt } : null;
+  // clientId 一起给出：客户端拿它和自己比，就能判断「占着房间的是不是我自己另开的窗口」，
+  // 不至于把自家引擎当成别人抢了控制权。
+  return room.owner ? { name: room.owner.name, since: room.owner.claimedAt, clientId: room.owner.clientId } : null;
 }
 
 /** 所有人可见：只有「正在播什么」，不含歌单。
