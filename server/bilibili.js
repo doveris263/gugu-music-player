@@ -93,7 +93,8 @@ const expiryOf = (url) => {
 };
 
 /** 解析视频，返回可入库的曲目。 */
-export async function resolveBilibili(input) {
+export async function resolveBilibili(input, opts = {}) {
+  const cidHint = opts.cidHint ? String(opts.cidHint) : "";
   let info = parseInput(input);
   if (!info) throw Object.assign(new Error("不是有效的 B 站视频链接"), { statusCode: 400 });
   if (info.short) {
@@ -111,7 +112,10 @@ export async function resolveBilibili(input) {
   if (view.code !== 0 || !view.data) throw Object.assign(new Error(`B 站接口：${view.message || view.code}`), { statusCode: 502 });
 
   const v = view.data;
-  const page = Math.min(Math.max(info.page, 1), v.pages?.length || 1);
+  // 链接里只写了视频号时，分P编号已经丢了。能用调用方给的 cid 反查就用它
+  // ——不这么做，多分P视频会全部还原成第 1P。
+  const hinted = cidHint ? (v.pages || []).findIndex((x) => String(x.cid) === cidHint) : -1;
+  const page = hinted >= 0 ? hinted + 1 : Math.min(Math.max(info.page, 1), v.pages?.length || 1);
   const pageInfo = v.pages?.[page - 1];
   const cid = pageInfo?.cid || v.cid;
   const audio = await audioUrlOf({ bvid: v.bvid, cid });
@@ -125,6 +129,7 @@ export async function resolveBilibili(input) {
     duration: Number(pageInfo?.duration || v.duration || 0),
     bvid: v.bvid,
     cid,
+    page,
     srcUrl: audio.url,
     mime: audio.mime,
     expiresAt: expiryOf(audio.url),

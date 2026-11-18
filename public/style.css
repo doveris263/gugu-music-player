@@ -93,6 +93,8 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .tag { font-size: 9px; padding: 0 4px; border-radius: 3px; border: 1px solid var(--line); }
 .tag.bilibili { color: #f09bb3; }
 .tag.upload { color: var(--green); }
+.tag.url { color: var(--gold); }
+
 .icon-btn { width: 24px; height: 24px; border-radius: 6px; display: grid; place-items: center; color: var(--dim2); }
 .icon-btn:hover { color: var(--red); background: rgba(224,108,117,0.12); }
 .icon-btn svg { width: 14px; height: 14px; }
@@ -136,6 +138,32 @@ input[type="range"]::-webkit-slider-thumb { appearance: none; width: 13px; heigh
 .section { font-size: 10.5px; letter-spacing: 0.12em; color: var(--dim2); margin: 14px 0 2px; }
 .section:first-child { margin-top: 0; }
 .foot { text-align: center; font-size: 10px; color: var(--dim2); padding: 10px 0 2px; }
+.list-tools { display: flex; gap: 8px; margin: 6px 0 8px; }
+
+/* 背景图：铺满 + 一层暗色蒙版，保证前景文字对比度不被图抢走。
+   关掉（没有 .has-bg）就还是原来那个径向渐变底。 */
+body.has-bg .app {
+  background:
+    linear-gradient(rgba(16, 18, 23, 0.66), rgba(16, 18, 23, 0.80)),
+    url("./assets/bg.png") center center / cover no-repeat fixed;
+}
+body.has-bg .card,
+body.has-bg .row,
+body.has-bg .setting,
+body.has-bg .empty,
+body.has-bg .kv { background-color: rgba(34, 38, 47, 0.84); }
+body.has-bg .tabs { background-color: rgba(34, 38, 47, 0.74); }
+.list-tools .chip[disabled] { opacity: 0.45; cursor: not-allowed; }
+
+/* 导入进度：做成歌单顶部的一条横幅，不是一条细线。
+   以前细、位置又靠下，导入快的时候用户根本没注意到它出现过。 */
+.csvprog { margin: 0 0 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(232,195,122,0.45); background: rgba(232,195,122,0.08); }
+.csvprog.done { border-color: rgba(111,207,151,0.5); background: rgba(111,207,151,0.08); }
+.csvprog-head { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--dim); margin-bottom: 8px; font-weight: 600; }
+.csvprog-bar { height: 7px; border-radius: 4px; background: rgba(255,255,255,0.10); overflow: hidden; }
+.csvprog-bar > i { display: block; height: 100%; border-radius: 4px; background: var(--gold); transition: width 0.18s ease-out; }
+.csvprog.done .csvprog-bar > i { background: var(--green); }
+.csvprog-sub { margin-top: 7px; font-size: 11px; color: var(--dim2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 提示 */
 .notice { display: flex; gap: 8px; align-items: flex-start; padding: 9px 11px; border-radius: 9px; border: 1px solid var(--line); background: rgba(255,255,255,0.03); font-size: 11.5px; color: var(--dim); line-height: 1.6; margin-bottom: 12px; }

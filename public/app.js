@@ -1,5 +1,5 @@
 // 浮窗界面：GM 看到控制台，玩家只看到「正在播放 + 自己的音量」。
-import { initOBR, createBus, apiGet, apiPost, uploadTrack, mediaDuration, lsGet, lsSet, lsDel, tokenKey, report } from "./lib.js";
+import { initOBR, createBus, apiGet, apiPost, apiBase, uploadTrack, mediaDuration, lsGet, lsSet, lsDel, tokenKey, report } from "./lib.js";
 import { Engine } from "./engine.js";
 
 window.__appBuild = "build-folders-1";
@@ -43,6 +43,10 @@ const PHASE_TEXT = { prepare: "准备中", sending: "传输中", committing: "�
 const PLAY_ERROR_TEXT = "播放出了点问题，刷新页面再联系 GM 试试";
 /** 诊断只留最近 20 条，放内存里：跳刷新保留不在需求里，写盘的代价换不来场景。 */
 const DIAG_MAX = 20;
+/** 前端构建标记：改了 public/ 下的前端代码就顺手改这里。
+    浏览器把旧 app.js 留在内存里时，界面看上去一切正常但新功能就是不出现，
+    这个字符串显示在「设置 → 诊断」里，一眼就能分清是代码没生效还是浏览器没刷新。 */
+const APP_BUILD = "2026-11-18 17:30";
 
 const S = {
   upd: { current: "", latest: "", hasUpdate: false, autoUpdate: true, ready: false, readyVersion: "" },
@@ -72,6 +76,9 @@ const S = {
   renaming: null, // 正在改名的曲目 { id, title, artist }
   sliderActive: false,
   sliderTimer: null,
+  loopPending: null, // 循环按钮的乐观值：点下去先改界面，服务端回话再对齐
+  csv: null, // 导入进度 { total, done, added, skipped, failed, line, title }
+  showBg: lsGet("bard:bg", "on") !== "off", // 背景图：每台设备各自记，默认开
 };
 
 let bus = null;
@@ -174,7 +181,8 @@ function diagHtml() {
   <div class="row2">
     <button class="btn block" data-act="diag-copy" ${rows.length ? "" : "disabled"}>复制全部</button>
     <button class="btn block" data-act="diag-clear" ${rows.length ? "" : "disabled"}>清空</button>
-  </div>`;
+  </div>
+  <div class="foot" style="text-align:left;padding-top:8px">前端版本 ${esc(APP_BUILD)}（对不上就是浏览器还在跑旧页面，Ctrl+F5 强制刷新）</div>`;
 }
 
 // ---------- 渲染 ----------
@@ -198,6 +206,8 @@ function render(force) {
       cover: S.now?.track?.cover,
       list: (S.state?.playlist || []).map((t) => t.id + t.title).join("|"),
       busy: S.busy,
+      loop: S.loopPending ?? S.now?.playback?.loop ?? "",
+      csv: S.csv ? `${S.csv.done}|${S.csv.added}|${S.csv.skipped}|${S.csv.failed}` : "",
       up: S.uploading ? `${S.uploading.phase}|${Math.round(S.uploading.pct * 100)}|${S.uploading.retry}` : "",
       updone: S.uploadDone,
       card: S.failCard ? `${S.failCard.name}|${S.failCard.timeText}` : "",
@@ -288,7 +298,7 @@ function nowCard(seekable) {
 function gmView() {
   const p = S.now?.playback;
   const list = S.state?.playlist || [];
-  const loop = p?.loop || "list";
+  const loop = S.loopPending ?? p?.loop ?? "list";
   const transport = `<div class="transport">
     <button class="tbtn" data-act="prev" ${list.length ? "" : "disabled"}>${icon("prev")}</button>
     <button class="tbtn play" data-act="toggle" ${S.now?.track || list.length ? "" : "disabled"}>${icon(
@@ -366,11 +376,18 @@ function listView(list) {
   const shown = tab === "__all" ? list : list.filter((t) => (t.folder || "") === target);
 
   const bar = folderBar();
+  // 歌单表格：导出成 CSV（Excel 双击可开），改完再导入回来。只 GM 用。
+  // 导入中直接把进度写进按钮文字：进度块再显眼也只是一条，按钮是一定在视线里的。
+  const csvBusy = S.busy === "csv" ? " disabled" : "";
+  const impLabel = S.busy === "csv" ? `导入中 ${S.csv?.done || 0}/${S.csv?.total || "…"}` : "导入表格";
+  // 进度块放在歌单最上方（不是按钮下面），一滚到底也还能看到
+  const prog = csvProgressHtml();
+  const tools = `<div class="list-tools"><button class="chip" data-act="export-csv"${csvBusy}>导出表格</button><button class="chip" data-act="import-csv"${csvBusy}>${impLabel}</button></div>`;
   if (!list.length) {
-    return `${bar}<div class="empty">${icon("music")}<div>还没有曲目</div><div>切到「添加」，放本地文件或粘贴 B 站链接</div></div>`;
+    return `${prog}${bar}${tools}<div class="empty">${icon("music")}<div>还没有曲目</div><div>切到「添加」，放本地文件或粘贴 B 站链接</div></div>`;
   }
   if (!shown.length) {
-    return `${bar}<div class="empty">${icon("music")}<div>这个分类还是空的</div><div>切到「添加」上传，曲目会进到当前分类</div></div>`;
+    return `${prog}${bar}${tools}<div class="empty">${icon("music")}<div>这个分类还是空的</div><div>切到「添加」上传，曲目会进到当前分类</div></div>`;
   }
 
   const cur = S.now?.playback?.trackId;
@@ -410,7 +427,7 @@ function listView(list) {
       <span class="idx">${on ? "▶" : i + 1}</span>
       <div class="row-main" data-act="pick" data-id="${esc(t.id)}">
         <div class="row-title">${esc(t.title || "未命名")}</div>
-        <div class="row-sub"><span class="tag ${t.kind}">${t.kind === "bilibili" ? "B站" : "本地"}</span>
+        <div class="row-sub"><span class="tag ${t.kind}">${t.kind === "bilibili" ? "B站" : t.kind === "url" ? "URL" : "本地"}</span>
           <span>${esc(t.artist || "")}</span>${
             t.folder ? `<span class="tag folder-tag">${esc(t.folder)}</span>` : ""
           }${t.duration > 0 ? `<span>${fmt(t.duration)}</span>` : ""}</div>
@@ -425,7 +442,7 @@ function listView(list) {
     .join("");
 
   const where = tab === "__all" ? "" : ` · 当前分类：${esc(tab === "__none" ? "未分类" : tab)}`;
-  return askHtml() + bar + rows + `<div class="foot">共 ${shown.length} 首${where} · 点标题立即切换</div>`;
+  return prog + askHtml() + bar + tools + rows + `<div class="foot">共 ${shown.length} 首${where} · 点标题立即切换</div>`;
 }
 
 function addView() {
@@ -457,14 +474,14 @@ function addView() {
     ${S.uploadDone ? `<div class="notice"><span>${esc(S.uploadDone)}</span></div>` : ""}
   </div>
   <div class="field">
-    <div class="label">B 站视频 <span class="hint">只取音轨</span></div>
+    <div class="label">链接添加 <span class="hint">B 站视频 / 音频直链</span></div>
     <div class="row2">
-      <input class="input" id="bili" placeholder="粘贴视频链接 / BV 号" value="${esc(S.biliUrl)}" />
+      <input class="input" id="bili" placeholder="粘贴 B 站链接、BV 号，或任意音频直链" value="${esc(S.biliUrl)}" />
       <button class="btn primary" data-act="add-bili" ${S.busy === "bili" ? "disabled" : ""}>${
-    S.busy === "bili" ? "解析中…" : "添加"
+    S.busy === "bili" ? "处理中…" : "添加"
   }</button>
     </div>
-    <div class="foot" style="text-align:left;padding-top:6px">支持 bilibili.com/video/BV…、b23.tv 短链、av 号</div>
+    <div class="foot" style="text-align:left;padding-top:6px">B 站：bilibili.com/video/BV…、b23.tv 短链、av 号　·　直链：以 mp3 / m4a / flac / wav / ogg / opus / aac / webm 结尾的 http(s) 地址</div>
   </div>`;
 }
 
@@ -486,6 +503,11 @@ function settingsView() {
   <div class="setting"><div class="setting-main"><div class="setting-title">对玩家显示曲目</div>
     <div class="setting-desc">关掉后玩家只看到「正在播放」</div></div>
     <button class="switch ${st.hideTitle ? "" : "on"}" data-act="toggle-hide"></button></div>
+
+  <div class="section">外观</div>
+  <div class="setting"><div class="setting-main"><div class="setting-title">背景图</div>
+    <div class="setting-desc">只影响你自己的界面，随时可关</div></div>
+    <button class="switch ${S.showBg ? "on" : ""}" data-act="toggle-bg"></button></div>
 
   <div class="section">状态</div>
   <div class="kv"><span>同步服务</span><span>${S.status.connected === false ? "未连接" : "已连接"}</span></div>
@@ -627,13 +649,47 @@ async function moveTrackTo(trackId, folder) {
 }
 // 内联 onclick 直接调用，避免事件委托在某些环境下收不到（也更好调试）
 // 单曲循环开关：走内联 onclick，和分类按钮同一套写法
-window.__bardLoop = () => {
+// 点下去先改按钮自己，网络回来再对齐。以前是等服务器响应才重绘整个视图，
+// 每次点击都有两三帧完全没反应的空白，连点起来就是「卡卡的」。
+function paintLoop(value) {
+  const btn = document.querySelector(".loop-btn");
+  if (!btn) return;
+  const on = value === "track";
+  btn.classList.toggle("active", on);
+  btn.dataset.loop = value;
+  btn.title = on ? "单曲循环：开（一直重复这首）" : "单曲循环：关（按列表依次播放）";
+  btn.innerHTML = icon(on ? "loop1" : "loop");
+}
+
+window.__bardLoop = async () => {
+  const cur = S.loopPending ?? (S.now?.playback?.loop || "list");
+  const next = cur === "track" ? "list" : "track";
+  if (!token()) return toast("还没有控制权", "err");
+  S.loopPending = next;
+  paintLoop(next);
   try {
-    const on = S.now?.playback?.loop === "track";
-    report("loop-click", { cur: S.now?.playback?.loop || "", next: on ? "list" : "track" });
-    command({ type: "settings", loop: on ? "list" : "track" });
-  } catch (e) {
-    report("loop-error", { message: String((e && e.message) || e) });
+    const res = await apiPost(`/api/rooms/${encodeURIComponent(S.roomId)}/command`, {
+      type: "settings",
+      loop: next,
+    }, token());
+    if (res?.state) S.state = res.state;
+    // 把响应里的 now 直接推给引擎，省掉引擎再问一次服务器的往返
+    if (res?.now) bus?.post({ t: "now", now: res.now });
+    else bus?.post({ t: "refresh" });
+    report("loop-click", { cur, next });
+    // 兜底：广播没送到也要把乐观值撤掉，不然按钮会永远停在本地那次点击上
+    setTimeout(() => {
+      if (S.loopPending === next) {
+        S.loopPending = null;
+        render();
+      }
+    }, 2000);
+  } catch (err) {
+    S.loopPending = null;
+    paintLoop(cur);
+    report("loop-error", { message: String((err && err.message) || err) });
+    diag("单曲循环", err.message);
+    toast(err.message, "err");
   }
 };
 window.__bardSetFolder = (el) => {
@@ -676,21 +732,195 @@ function release() {
 
 async function addBilibili() {
   const url = (document.getElementById("bili")?.value || S.biliUrl || "").trim();
-  if (!url) return toast("先粘贴一个 B 站链接", "warn");
+  if (!url) return toast("先粘贴一个链接", "warn");
+  // B 站四种写法：BV 号、av 号、bilibili.com、b23.tv 短链；其余一律按音频直链处理
+  const isBili = /^BV[0-9A-Za-z]+$/.test(url) || /^av\d+$/i.test(url) || /bilibili\.com|b23\.tv/i.test(url);
+  const path = isBili ? "tracks/bilibili" : "tracks/url";
   S.busy = "bili";
   render(true);
   try {
-    await apiPost(`/api/rooms/${encodeURIComponent(S.roomId)}/tracks/bilibili`, { url, folder: activeFolder() }, token());
+    await apiPost(`/api/rooms/${encodeURIComponent(S.roomId)}/${path}`, { url, folder: activeFolder() }, token());
     S.biliUrl = "";
     toast("已加入歌单");
     await refreshState();
   } catch (err) {
-    diag("B 站解析", err.message);
+    diag(isBili ? "B 站解析" : "链接添加", err.message);
     toast(err.message, "err");
   } finally {
     S.busy = "";
     render(true);
   }
+}
+
+// ---------- 歌单表格：导出 / 导入 ----------
+// 导出的是元数据（曲名/歌手/分类/类型/链接/时长/文件标识）。
+// 本地曲目按「文件标识」还原——那就是服务端自己存的音频文件名，文件还在就能直接挂回来，
+// 不用重新上传。B 站曲目按链接重新解析。
+async function exportPlaylistCsv() {
+  const url = `${apiBase()}/api/rooms/${encodeURIComponent(S.roomId)}/export`;
+  try {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token()}` } });
+    if (!res.ok) throw new Error(`导出失败（${res.status}）`);
+    const blob = await res.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objUrl;
+    a.download = `歌单-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
+    toast("已导出表格，用 Excel 打开即可");
+  } catch (err) {
+    // fetch 被拦（内嵌 iframe 的 CSP / 沙箱常常这样）时，退回「直接导航下载」：
+    // 服务端这条路由认 ?token=，浏览器会按 Content-Disposition 存文件。
+    diag("导出歌单", `${err.message} —— 改用直链下载`);
+    try {
+      const f = document.createElement("iframe");
+      f.style.display = "none";
+      f.src = `${url}?token=${encodeURIComponent(token() || "")}`;
+      document.body.appendChild(f);
+      setTimeout(() => f.remove(), 20000);
+      toast("已开始下载表格");
+    } catch (err2) {
+      toast(`导出失败：${err.message}`, "err");
+    }
+  }
+}
+
+/** 隐藏的文件选择框只建一次，挂在 body 上。
+    以前它写在歌单视图的 HTML 里，而那个视图每次广播都会重绘：
+    选文件的对话框还开着时视图已经重画，用户选中文件后 change 事件发在一个
+    已经脱离文档的旧元素上，冒泡不到 document —— 界面表现就是「点了导入完全没反应」。
+    另外 input.value 必须先清空：同一个文件连选两次不会触发 change。 */
+function openCsvPicker() {
+  let inp = document.getElementById("csv-file");
+  if (!inp) {
+    inp = document.createElement("input");
+    inp.id = "csv-file";
+    inp.type = "file";
+    inp.accept = ".csv,text/csv";
+    inp.style.cssText = "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none";
+    document.body.appendChild(inp);
+  }
+  inp.value = "";
+  inp.click();
+}
+
+async function importPlaylistCsv(file) {
+  if (!file) return;
+  const mine = { total: 0, done: 0, added: 0, skipped: 0, failed: 0, line: 0, title: "" };
+  S.busy = "csv";
+  S.csv = mine;
+  render(true);
+  let result = null;
+  try {
+    const text = await file.text();
+    const room = encodeURIComponent(S.roomId);
+    const res = await fetch(`${apiBase()}/api/rooms/${room}/import`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token()}` },
+      body: JSON.stringify({ csv: text }),
+    });
+    const head = await res.json().catch(() => ({}));
+    if (!res.ok || !head.jobId) throw new Error(head.error || `导入失败（${res.status}）`);
+    mine.total = Number(head.total) || 0;
+
+    // 进度靠轮询，不用长连接：
+    // 以前是 NDJSON 流，一面跑一面推；中间任何一层代理缓冲或断流，前端就直接 Failed to fetch。
+    // 现在每 250ms 拉一次快照，请求都是短的，网络再差也不会挂在半路。
+    const jobUrl = `${apiBase()}/api/rooms/${room}/import/${encodeURIComponent(head.jobId)}`;
+    for (let i = 0; i < 2400 && !result; i++) {
+      const r = await fetch(jobUrl, { headers: { Authorization: `Bearer ${token()}` }, cache: "no-store" });
+      if (r.status === 404) throw new Error("导入任务已过期，请重新导一次");
+      const s = await r.json().catch(() => null);
+      if (s) {
+        mine.total = Number(s.total) || mine.total;
+        mine.done = Number(s.done) || 0;
+        mine.added = Number(s.added) || 0;
+        mine.skipped = Number(s.skipped) || 0;
+        mine.failed = Number(s.failed) || 0;
+        mine.line = Number(s.line) || 0;
+        mine.title = s.title || "";
+        paintCsvProgress();
+        if (s.finished) {
+          result = s;
+          break;
+        }
+      }
+      await new Promise((ok) => setTimeout(ok, 250));
+    }
+    if (!result) throw new Error("导入超时：歌单里已处理完的曲目会保留，刷新页面可以看");
+
+    const r = result;
+    const parts = [`新增 ${r.added} 首`];
+    if (r.skipped) parts.push(`跳过重复 ${r.skipped} 首`);
+    if (r.failed) parts.push(`没进来 ${r.failed} 首`);
+    toast(parts.join("，"), r.failed ? "warn" : "info", 6000);
+    if (r.failed) {
+      const lines = (r.details?.failed || []).slice(0, 5).map((f) => `第 ${f.line} 行「${f.title || "无标题"}」：${f.reason}`);
+      S.notice = {
+        text: `有 ${r.failed} 首没进来 —— ${lines.join("；")}${r.failed > 5 ? "；……" : ""}`,
+        kind: "err",
+      };
+    }
+    await refreshState();
+  } catch (err) {
+    diag("导入歌单", err.message);
+    toast(err.message, "err");
+  } finally {
+    S.busy = "";
+    render(true);
+    // 进度条留在原处停一下再收：一完成就消失的话，用户看不到到底跑完了没有。
+    // 6 秒：本地曲目为主的表格几百毫秒就跑完了，2 秒容易被眼睛错过。
+    setTimeout(() => {
+      if (S.csv === mine) {
+        S.csv = null;
+        render(true);
+      }
+    }, 6000);
+  }
+}
+
+/** 只重画进度那一块：整个歌单重绘会让列表跟着闪。
+    顺便把「导入中 n/总数」写进导入按钮 —— 进度块可能被滚出视野，按钮不会。 */
+function paintCsvProgress() {
+  const el = document.getElementById("csv-prog");
+  if (el) el.outerHTML = csvProgressHtml();
+  else {
+    // 这块可能在上一轮渲染时还不存在（那时 S.csv 是 null），不能等下次重渲染：
+    // 短歌单可能跑完了都没等到那一次，用户就什么都看不见。就地插到按钮行后面。
+    const host = document.querySelector(".list-tools");
+    if (host && !host.nextElementSibling?.classList?.contains("csvprog")) {
+      host.insertAdjacentHTML("afterend", csvProgressHtml());
+    }
+  }
+  const btn = document.querySelector('[data-act="import-csv"]');
+  if (btn) {
+    const c = S.csv;
+    btn.textContent = c && c.total && c.done < c.total ? `导入中 ${c.done}/${c.total}` : "导入表格";
+  }
+}
+
+function csvProgressHtml() {
+  const c = S.csv;
+  if (!c) return "";
+  const total = Number(c.total) || 0;
+  const pct = total ? Math.min(100, Math.round((c.done / total) * 100)) : 6;
+  const finished = total > 0 && c.done >= total;
+  const stat = [`新增 ${c.added}`];
+  if (c.skipped) stat.push(`跳过 ${c.skipped}`);
+  if (c.failed) stat.push(`失败 ${c.failed}`);
+  const sub = finished
+    ? "正在刷新歌单…"
+    : c.title
+      ? `第 ${c.line} 行：${c.title}`
+      : "读取表格中…";
+  return `<div class="csvprog${finished ? " done" : ""}" id="csv-prog">
+    <div class="csvprog-head"><span>${finished ? "导入完成" : "正在导入"} ${c.done}/${total || "…"}　${pct}%</span><span>${stat.join(" · ")}</span></div>
+    <div class="csvprog-bar"><i style="width:${pct}%"></i></div>
+    <div class="csvprog-sub">${esc(sub)}</div>
+  </div>`;
 }
 
 function activeFolder() {
@@ -776,8 +1006,16 @@ document.addEventListener("click", (ev) => {
   else if (act === "remove") {
     askConfirm("从歌单移除这首？", { type: "playlist", op: "remove", trackId: id });
   } else if (act === "pick-file") document.getElementById("file")?.click();
+  else if (act === "export-csv") exportPlaylistCsv();
+  else if (act === "import-csv") openCsvPicker();
   else if (act === "add-bili") addBilibili();
   else if (act === "toggle-hide") command({ type: "settings", hideTitle: !S.state?.settings?.hideTitle });
+  else if (act === "toggle-bg") {
+    S.showBg = !S.showBg;
+    lsSet("bard:bg", S.showBg ? "on" : "off");
+    applyBg();
+    render(true);
+  }
   else if (act === "unlock") bus?.post({ t: "unlock" });
   else if (act === "fail-copy") {
     copyText(failCardText(S.failCard || {})).then((ok) =>
@@ -1028,6 +1266,9 @@ document.addEventListener("change", (ev) => {
   if (ev.target.id === "file") {
     doUpload(ev.target.files || []);
     ev.target.value = "";
+  } else if (ev.target.id === "csv-file") {
+    importPlaylistCsv(ev.target.files && ev.target.files[0]);
+    ev.target.value = "";
   } else if (ev.target.dataset.act === "master-vol") {
     // 松手：立刻把最终音量发出去，不依赖节流定时器
     flushMasterVolume(Number(ev.target.value) / 100);
@@ -1072,8 +1313,13 @@ async function loadUpdateState() {
 }
 
 // ---------- 启动 ----------
+// 背景图：类名挂到 body 上，样式里只管 .has-bg 这一种形态；关掉就回到纯色底。
+function applyBg() {
+  document.body.classList.toggle("has-bg", Boolean(S.showBg));
+}
+
 async function boot() {
-  window.__bardBooted = true;
+  applyBg();
   loadUpdateState().then(() => render(true)).catch(() => {});
   const { OBR, role, roomId, attempts, ready } = await initOBR();
   S.role = role;
@@ -1112,6 +1358,8 @@ function onBus(msg) {
     case "now":
       S.now = msg.now;
       if (msg.now?.serverTime) S.skew = msg.now.serverTime - Date.now();
+      // 广播回来的值已经跟服务端一致，乐观值该撤了（否则按钮会永远停在本地那次点击上）
+      if (S.loopPending && msg.now?.playback?.loop === S.loopPending) S.loopPending = null;
       render();
       break;
     case "state":

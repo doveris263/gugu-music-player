@@ -827,6 +827,343 @@ route("POST", "/api/rooms/:room/tracks/bilibili", async (req, res, p, search) =>
   }
 });
 
+// 任意音频直链：不解析、不下载，原样存进歌单，播放时由 /audio 连到源站转发。
+// 与 B 站的区别：这里没有「重新解析」这一步 —— 源站删了文件或换了地址，就是失效，没有补救。
+function urlTrackFrom(rawUrl, title) {
+  let u;
+  try {
+    u = new URL(String(rawUrl || "").trim());
+  } catch {
+    throw Object.assign(new Error("这不是一个有效的链接"), { statusCode: 400 });
+  }
+  if (!/^https?:$/.test(u.protocol)) {
+    throw Object.assign(new Error("只支持 http / https 链接"), { statusCode: 400 });
+  }
+  const base = decodeURIComponent(u.pathname.split("/").pop() || "");
+  if (/\.m3u8$/i.test(base)) {
+    throw Object.assign(new Error("不支持 m3u8 播放列表，请用单个音频文件的直链"), { statusCode: 400 });
+  }
+  const ext = (/\.([^.]+)$/.exec(base) || [])[0]?.toLowerCase() || "";
+  if (ext && !AUDIO[ext]) {
+    throw Object.assign(new Error(`这个链接不是支持的音频格式（${AUDIO_LIST}）`), { statusCode: 400 });
+  }
+  return {
+    kind: "url",
+    url: u.toString(),
+    srcUrl: u.toString(),
+    title: String(title || base.replace(/\.[^.]+$/, "") || u.hostname).slice(0, 120),
+    artist: u.hostname,
+    mime: ext ? audioMimeFor(base) : "",
+    duration: 0,
+  };
+}
+
+route("POST", "/api/rooms/:room/tracks/url", async (req, res, p, search) => {
+  if (!guard(req, res, p.room, bearer(req, search))) return;
+  const { url, folder, title } = await readJson(req);
+  if (!url) return json(req, res, 400, { error: "请提供音频链接" });
+  try {
+    const track = store.addTrack(p.room, { ...urlTrackFrom(url, title), folder: cleanFolder(folder || "") });
+    publish(p.room);
+    json(req, res, 200, { ok: true, track });
+  } catch (err) {
+    json(req, res, err.statusCode || 502, { error: err.message || "链接不可用" });
+  }
+});
+
+// ---------- 歌单表格：导出 / 导入（仅 GM） ----------
+// 本地曲目在表里记的是服务端自己的存储名 —— 浏览器从来拿不到用户的原始磁盘路径，
+// 而音频文件本来就存在 data/tracks/<房间>/ 下，所以「不换电脑、不重新上传」也能还原。
+const CSV_HEAD = ["序号", "曲名", "歌手", "分类", "类型", "链接", "时长", "文件标识"];
+
+const csvCell = (v) => {
+  const s = v === null || v === undefined ? "" : String(v);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+/** 极简 CSV 解析：引号包裹、引号内逗号/换行、"" 转义。Excel 另存为「CSV UTF-8」即可。 */
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let quoted = false;
+  const s = String(text || "").replace(/^\uFEFF/, "");
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quoted) {
+      if (c === '"') {
+        if (s[i + 1] === '"') {
+          cell += '"';
+          i++;
+        } else quoted = false;
+      } else cell += c;
+      continue;
+    }
+    if (c === '"') quoted = true;
+    else if (c === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (c === "\r") continue;
+    else if (c === "\n") {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else cell += c;
+  }
+  if (cell !== "" || row.length) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows.filter((r) => r.some((c) => String(c).trim() !== ""));
+}
+
+route("GET", "/api/rooms/:room/export", (req, res, p, search) => {
+  const room = guard(req, res, p.room, bearer(req, search));
+  if (!room) return;
+  const rows = [CSV_HEAD];
+  room.playlist.forEach((t, i) => {
+    const bili = t.kind === "bilibili";
+    const isUrl = t.kind === "url";
+    rows.push([
+      i + 1,
+      t.title || "",
+      t.artist || "",
+      t.folder || "",
+      bili ? "B站" : isUrl ? "URL" : "本地",
+      bili
+        ? `https://www.bilibili.com/video/${t.bvid || ""}${Number(t.page) > 1 ? `?p=${Number(t.page)}` : ""}`
+        : isUrl
+          ? t.url || t.srcUrl || ""
+          : t.fileName || "",
+      Math.round(Number(t.duration) || 0),
+      bili ? `${t.bvid || ""}#${t.cid || ""}` : isUrl ? t.url || t.srcUrl || "" : t.fileName || "",
+    ]);
+  });
+  const buf = Buffer.from("\uFEFF" + rows.map((r) => r.map(csvCell).join(",")).join("\r\n") + "\r\n", "utf8");
+  const name = `gugu-playlist-${p.room}-${new Date().toISOString().slice(0, 10)}.csv`;
+  res.writeHead(200, {
+    "Content-Type": "text/csv; charset=utf-8",
+    "Content-Length": buf.length,
+    "Content-Disposition": `attachment; filename="${name}"; filename*=UTF-8''${encodeURIComponent(name)}`,
+  });
+  res.end(buf);
+});
+
+route("POST", "/api/rooms/:room/import", async (req, res, p, search) => {
+  const room = guard(req, res, p.room, bearer(req, search));
+  if (!room) return;
+  let body = null;
+  try {
+    body = await readJson(req, 8 * 1024 * 1024);
+  } catch {
+    body = null;
+  }
+  const csv = body && typeof body.csv === "string" ? body.csv : "";
+  if (!csv.trim()) return json(req, res, 400, { error: "没有收到表格内容" });
+
+  const rows = parseCsv(csv);
+  if (rows.length < 2) return json(req, res, 400, { error: "表格里没有数据行" });
+  const head = rows[0].map((h) => String(h).trim());
+  const col = (name) => head.indexOf(name);
+  const cTitle = col("曲名");
+  const cType = col("类型");
+  if (cTitle < 0 || cType < 0) {
+    return json(req, res, 400, { error: "表格缺列：至少要「曲名」和「类型」。请用本程序导出的表格当模板" });
+  }
+  const cArtist = col("歌手");
+  const cFolder = col("分类");
+  const cLink = col("链接");
+  const cDur = col("时长");
+  const cKey = col("文件标识");
+  const pick = (r, i) => (i >= 0 && r[i] !== undefined ? String(r[i]).trim() : "");
+
+  // 导入改成「任务 + 轮询」。以前是一条 NDJSON 长连接，一面处理一面往下推：
+  // 中间任何一层代理缓冲、或者连接被提前关掉，前端就直接 Failed to fetch，进度停在原地。
+  // 现在 POST 立刻回一个 jobId，前端每 250ms 拉一次快照，网络再差也不会挂着等。
+  const job = {
+    id: uid(),
+    room: p.room,
+    total: rows.length - 1,
+    done: 0,
+    added: 0,
+    skipped: 0,
+    failed: 0,
+    line: 0,
+    title: "",
+    finished: false,
+    at: Date.now(),
+    details: { skipped: [], failed: [] },
+  };
+  for (const [k, v] of importJobs) if (job.at - v.at > 5 * 60_000) importJobs.delete(k);
+  importJobs.set(job.id, job);
+
+  json(req, res, 200, { jobId: job.id, total: job.total });
+
+  // 响应已经发出去了，下面这段在后台接着跑，进度写进 job 等前端来拉
+  void runImportJob(job, p.room, rows, { cTitle, cType, cArtist, cFolder, cLink, cDur, cKey });
+});
+
+/** 正在跑的导入任务：jobId -> 快照。前端轮询这张表，5 分钟后自动清掉。 */
+const importJobs = new Map();
+
+async function runImportJob(job, roomId, rows, cols) {
+  const { cTitle, cType, cArtist, cFolder, cLink, cDur, cKey } = cols;
+  const pick = (r, i) => (i >= 0 && r[i] !== undefined ? String(r[i]).trim() : "");
+  const room = store.get(roomId);
+  if (!room) {
+    job.finished = true;
+    return;
+  }
+
+  // 判断「重复」的身份：本地按服务端存储名，B 站按 bvid + cid（改曲名不影响判断）
+  const haveLocal = new Set(
+    room.playlist.filter((t) => t.kind === "upload" && t.fileName).map((t) => t.fileName)
+  );
+  const haveBili = new Set(
+    room.playlist.filter((t) => t.kind === "bilibili").map((t) => `${t.bvid || ""}#${t.cid || ""}`)
+  );
+  const haveUrl = new Set(
+    room.playlist.filter((t) => t.kind === "url").map((t) => t.url || t.srcUrl || "")
+  );
+
+  const added = [];
+  const skipped = [];
+  const failed = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const title = pick(r, cTitle);
+    const line = i + 1;
+    const nA = added.length,
+      nS = skipped.length;
+    const typeText = pick(r, cType).toLowerCase();
+    const isBili = /站|bilibili/.test(typeText);
+    const isUrlKind = !isBili && /url|直链|链接/.test(typeText);
+    try {
+      if (isUrlKind) {
+        // 通用直链：表里「链接」列就是地址本身，导入时不用重新解析，只做格式校验
+        const link = pick(r, cLink) || pick(r, cKey);
+        if (!link) {
+          failed.push({ line, title, reason: "URL 行缺少链接" });
+          continue;
+        }
+        let made = null;
+        try {
+          made = urlTrackFrom(link, title);
+        } catch (err) {
+          failed.push({ line, title, reason: err.message });
+          continue;
+        }
+        if (haveUrl.has(made.url)) {
+          skipped.push({ line, title: title || made.title });
+          continue;
+        }
+        added.push(
+          store.addTrack(roomId, {
+            ...made,
+            artist: pick(r, cArtist) || made.artist,
+            duration: Number(pick(r, cDur)) || 0,
+            folder: cleanFolder(pick(r, cFolder)),
+          })
+        );
+        haveUrl.add(made.url);
+      } else if (isBili) {
+        const keyRaw = String(pick(r, cKey) || "");
+        const cidHint = keyRaw.includes("#") ? keyRaw.split("#")[1].trim() : "";
+        const link = pick(r, cLink) || `https://www.bilibili.com/video/${keyRaw.split("#")[0]}`;
+        if (!/bilibili|b23/.test(link)) {
+          failed.push({ line, title, reason: "B 站行缺少可用链接" });
+          continue;
+        }
+        // 用表格里的 cid 反查分P：链接里只有视频号，照它解析会还原成第 1P
+        const parsed = await resolveBilibili(link, { cidHint });
+        const key = `${parsed.bvid || ""}#${parsed.cid || ""}`;
+        if (haveBili.has(key)) {
+          skipped.push({ line, title: parsed.title });
+          continue;
+        }
+        added.push(store.addTrack(roomId, { ...parsed, folder: cleanFolder(pick(r, cFolder)) }));
+        haveBili.add(key);
+      } else {
+        const raw = pick(r, cKey) || pick(r, cLink);
+        const fileName = path.basename(String(raw || ""));
+        if (!fileName) {
+          failed.push({ line, title, reason: "本地行缺少文件标识" });
+          continue;
+        }
+        if (!isAudio(fileName)) {
+          failed.push({ line, title, reason: `不是支持的音频格式（${AUDIO_LIST}）` });
+          continue;
+        }
+        if (haveLocal.has(fileName)) {
+          skipped.push({ line, title: title || fileName });
+          continue;
+        }
+        const abs = path.join(store.tracksDir(roomId), fileName);
+        let size = 0;
+        try {
+          size = (await fs.promises.stat(abs)).size;
+        } catch {
+          size = 0;
+        }
+        if (!size) {
+          failed.push({ line, title, reason: "服务端找不到这个音频文件（可能已被删除）" });
+          continue;
+        }
+        added.push(
+          store.addTrack(roomId, {
+            kind: "upload",
+            title: (title || fileName.replace(/\.[^.]+$/, "")).slice(0, 120),
+            artist: pick(r, cArtist) || "本地文件",
+            fileName,
+            mime: audioMimeFor(fileName),
+            size,
+            duration: Number(pick(r, cDur)) || 0,
+            folder: cleanFolder(pick(r, cFolder)),
+          })
+        );
+        haveLocal.add(fileName);
+      }
+    } catch (err) {
+      failed.push({ line, title, reason: err.message || "解析失败" });
+    } finally {
+      // continue 也会走到这里，所以每一行恰好推进一步进度
+      job.done = i;
+      job.line = line;
+      job.title =
+        (added.length > nA ? added.at(-1).title : skipped.length > nS ? skipped.at(-1).title : title) ||
+        title;
+      job.added = added.length;
+      job.skipped = skipped.length;
+      job.failed = failed.length;
+      job.at = Date.now();
+    }
+  }
+
+  if (added.length) publish(roomId);
+  job.details = { skipped, failed };
+  job.finished = true;
+  job.at = Date.now();
+}
+
+route("GET", "/api/rooms/:room/import/:job", (req, res, p, search) => {
+  if (!guard(req, res, p.room, bearer(req, search))) return;
+  const job = importJobs.get(p.job);
+  if (!job || job.room !== p.room) return json(req, res, 404, { error: "导入任务不存在或已过期" });
+  json(req, res, 200, {
+    total: job.total,
+    done: job.done,
+    added: job.added,
+    skipped: job.skipped,
+    failed: job.failed,
+    line: job.line,
+    title: job.title,
+    finished: job.finished,
+    details: job.finished ? job.details : undefined,
+  });
+});
+
 route("DELETE", "/api/rooms/:room/tracks/:id", (req, res, p, search) => {
   if (!guard(req, res, p.room, bearer(req, search))) return;
   if (!store.removeTrack(p.room, p.id)) return json(req, res, 404, { error: "曲目不存在" });
